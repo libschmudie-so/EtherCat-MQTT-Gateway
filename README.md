@@ -27,9 +27,9 @@ Process data can be monitored and written through MQTT, enabling integration wit
 ├── Dockerfile
 ├── entrypoint.sh
 └── EtherCatMqttGateway
-├── EtherCatMqttGateway.csproj
-├── Program.cs
-└── SlaveDevice.cs
+  ├── EtherCatMqttGateway.csproj
+  ├── Program.cs
+  └── SlaveDevice.cs
 
 ````
 
