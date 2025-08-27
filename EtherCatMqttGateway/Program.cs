@@ -14,6 +14,7 @@ using Microsoft.Extensions.Logging;
 using MQTTnet;
 using MQTTnet.Protocol;
 using Newtonsoft.Json.Linq;
+using Newtonsoft.Json;
 
 using EtherCAT.NET;
 using EtherCAT.NET.Extension;
@@ -37,6 +38,10 @@ namespace EtherCatMqttGateway
         /// <summary>MQTT broker port (default: 1883).</summary>
         [Option('p', "port", Required = false, Default = 1883, HelpText = "MQTT broker port.")]
         public int Port { get; set; } = 1883;
+
+        /// <summary>MQTT root topic (default: ethercat).</summary>
+        [Option('t', "topic", Required = false, Default = "ethercat", HelpText = "MQTT root topic.")]
+        public string Topic { get; set; } = "ethercat";
 
         /// <summary>ESI directory (default: %LocalAppData%/ESI).</summary>
         [Option('e', "esi", Required = false, HelpText = "ESI directory path.")]
@@ -72,6 +77,7 @@ namespace EtherCatMqttGateway
             string Interface,
             string Broker,
             int Port,
+            string Topic,
             string? EsiDir,
             uint FrequencyHz,
             bool RetainProcessData,
@@ -88,7 +94,6 @@ namespace EtherCatMqttGateway
         private static List<SlaveDevice> SlaveDevices = new();
         private static IMqttClient? MqttClient;
         private static Args Parsed = default!;
-        private static readonly string StatusTopic = "ethercat/bridge/status";
 
         /// <summary>
         /// Application entry point. Parses CLI options, initializes logging, and runs the bridge.
@@ -122,10 +127,12 @@ namespace EtherCatMqttGateway
                     try
                     {
                         exitCode = await RunAsync();
-                    } catch (OperationCanceledException)
+                    }
+                    catch (OperationCanceledException)
                     {
                         exitCode = 0;
-                    } catch (Exception ex)
+                    }
+                    catch (Exception ex)
                     {
                         Logger.LogCritical(ex, "Fatal error");
                         exitCode = 1;
@@ -159,6 +166,7 @@ namespace EtherCatMqttGateway
                 Interface: cli.Interface,
                 Broker: cli.Broker,
                 Port: cli.Port,
+                Topic: cli.Topic,
                 EsiDir: cli.EsiDir,
                 FrequencyHz: cli.FrequencyHz,
                 RetainProcessData: cli.RetainProcessData,
@@ -172,8 +180,8 @@ namespace EtherCatMqttGateway
         private static async Task<int> RunAsync()
         {
             Logger.LogInformation("Starting EtherCatMqttGateway");
-            Logger.LogInformation("Interface={Interface} Broker={Broker}:{Port} ESI={EsiDir} Freq={FreqHz}Hz RetainProcessData={Retain}",
-                Parsed.Interface, Parsed.Broker, Parsed.Port, Parsed.EsiDir ?? "<default>", Parsed.FrequencyHz, Parsed.RetainProcessData);
+            Logger.LogInformation("Interface={Interface} Broker={Broker}:{Port} ESI={EsiDir} Freq={FreqHz}Hz RetainProcessData={Retain} RootTopic={Topic}",
+                Parsed.Interface, Parsed.Broker, Parsed.Port, Parsed.EsiDir ?? "<default>", Parsed.FrequencyHz, Parsed.RetainProcessData, Parsed.Topic);
 
             var esiDirectoryPath = Parsed.EsiDir ?? Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ESI");
@@ -191,7 +199,7 @@ namespace EtherCatMqttGateway
 
             Master = new EcMaster(settings);
 
-            Logger.LogInformation("Configuring EtherCAT master (this may take a few seconds)...");
+            Logger.LogInformation("Configuring EtherCAT master (this may take a few seconds)");
 
             try
             {
@@ -213,7 +221,7 @@ namespace EtherCatMqttGateway
                 .WithClientId("EtherCATMaster")
                 .WithTcpServer(Parsed.Broker, Parsed.Port)
                 .WithCleanSession(false)
-                .WithWillTopic(StatusTopic)
+                .WithWillTopic($"{Parsed.Topic}/bridge/status")
                 .WithWillPayload("offline")
                 .WithWillRetain(true)
                 .WithWillQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
@@ -267,11 +275,14 @@ namespace EtherCatMqttGateway
 
             await PublishStatusAsync("online", retain: true);
 
+            var slaveSummary = new JObject();
+
             // Publish static metadata and subscribe to per-slave wildcard output topics.
             foreach (var sd in SlaveDevices)
             {
-                var metaTopic = $"ethercat/{sd.GetCsa()}/metadata";
-                var metaPayload = sd.GetMetadata().ToString();
+                var metaTopic = $"{Parsed.Topic}/{sd.GetCsa()}/metadata";
+                var slaveMeta = sd.GetMetadata();
+                var metaPayload = slaveMeta.ToString();
 
                 var msg = new MqttApplicationMessageBuilder()
                     .WithTopic(metaTopic)
@@ -281,11 +292,17 @@ namespace EtherCatMqttGateway
                     .Build();
                 await MqttClient.PublishAsync(msg);
 
-                var outFilter = $"ethercat/{sd.GetCsa()}/+/+";
+                var outFilter = $"{Parsed.Topic}/{sd.GetCsa()}/+/+";
                 await MqttClient.SubscribeAsync(
                     new MqttClientSubscribeOptionsBuilder()
                         .WithTopicFilter(outFilter, MqttQualityOfServiceLevel.AtLeastOnce)
                         .Build());
+
+                slaveSummary[sd.GetCsa().ToString()] = new JObject
+                {
+                    ["name"] = slaveMeta["name"],
+                    ["description"] = slaveMeta["description"]
+                };
             }
 
             // Expose bridge info for observability.
@@ -294,9 +311,10 @@ namespace EtherCatMqttGateway
                 ["interface"] = Parsed.Interface,
                 ["frequency_hz"] = Parsed.FrequencyHz,
                 ["esi_path"] = esiDirectoryPath,
-                ["started_utc"] = DateTime.UtcNow
+                ["started_utc"] = DateTime.UtcNow,
+                ["slaves"] = slaveSummary
             };
-            await PublishJsonAsync("ethercat/bridge/info", info, retain: true);
+            await PublishJsonAsync($"{Parsed.Topic}/bridge/info", info, retain: true);
 
             using var cts = new CancellationTokenSource();
             Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
@@ -328,33 +346,35 @@ namespace EtherCatMqttGateway
                                 .FirstOrDefault(v => v.Index == req.Index && v.SubIndex == req.SubIndex);
                             if (varDesc == null) continue;
 
+                            if (req.Value.ToString().Length == 0) continue;
+
                             try
                             {
                                 sd.WriteVariableAsJToken(varDesc, req.Value);
                             }
                             catch (Exception ex)
                             {
-                                Logger.LogWarning(ex, "Failed to write CSA={Csa} {Index:X4}/{Sub:X2}",
-                                    req.Csa, req.Index, req.SubIndex);
+                                Logger.LogWarning(ex, "Failed to write CSA={Csa} {Index:X4}/{Sub:X2} '{Value}' {Type}",
+                                    req.Csa, req.Index, req.SubIndex, req.Value, req.Value.Type);
                             }
                         }
 
                         Master.UpdateIO(DateTime.UtcNow);
 
                         foreach (var sd in SlaveDevices)
-                        foreach (var v in sd.GetAllVariables())
-                        {
-                            if (v.DataType <= 0) continue;
-                            var topic = $"ethercat/{sd.GetCsa()}/{v.Index:X4}/{v.SubIndex:X2}";
-                            var value = sd.ReadVariableAsJToken(v);
-                            snapshot.Add((topic, value));
-                        }
+                            foreach (var v in sd.GetAllVariables())
+                            {
+                                if (v.DataType <= 0) continue;
+                                var topic = $"{Parsed.Topic}/{sd.GetCsa()}/{v.Index:X4}/{v.SubIndex:X2}";
+                                var value = sd.ReadVariableAsJToken(v);
+                                snapshot.Add((topic, value));
+                            }
                     }
 
                     // Publish MQTT outside the lock.
                     foreach (var (topic, value) in snapshot)
                     {
-                        var strVal = value.ToString();
+                        var strVal = JsonConvert.SerializeObject(value);
 
                         if (Cache.TryGetValue(topic, out var old) && old == strVal)
                             continue;
@@ -425,7 +445,7 @@ namespace EtherCatMqttGateway
             if (!TryParseValue(e.ApplicationMessage.Payload, out var value))
                 return Task.CompletedTask;
 
-            string strVal = value.ToString();
+            var strVal = JsonConvert.SerializeObject(value);
 
             if (Cache.TryGetValue(topic, out var old) && old == strVal)
                 return Task.CompletedTask;
@@ -435,12 +455,12 @@ namespace EtherCatMqttGateway
             try
             {
                 var parts = topic.Split('/');
-                if (parts.Length < 4 || !string.Equals(parts[0], "ethercat", StringComparison.Ordinal))
+                if (parts.Length < 4 || !string.Equals(string.Join("/", parts.Take(parts.Length - 3)), Parsed.Topic, StringComparison.Ordinal))
                     return Task.CompletedTask;
 
-                csa   = Convert.ToUInt16(parts[^3]);
+                csa = Convert.ToUInt16(parts[^3]);
                 index = Convert.ToUInt16(parts[^2], 16);
-                sub   = Convert.ToByte(parts[^1], 16);
+                sub = Convert.ToByte(parts[^1], 16);
             }
             catch
             {
@@ -486,7 +506,7 @@ namespace EtherCatMqttGateway
             if (MqttClient == null) return;
 
             var msg = new MqttApplicationMessageBuilder()
-                .WithTopic(StatusTopic)
+                .WithTopic($"{Parsed.Topic}/bridge/status")
                 .WithPayload(state)
                 .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
                 .WithRetainFlag(retain)
@@ -504,7 +524,7 @@ namespace EtherCatMqttGateway
 
             var msg = new MqttApplicationMessageBuilder()
                 .WithTopic(topic)
-                .WithPayload(json.ToString())
+                .WithPayload(JsonConvert.SerializeObject(json))
                 .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
                 .WithRetainFlag(retain)
                 .Build();
@@ -521,7 +541,7 @@ namespace EtherCatMqttGateway
 
             foreach (var sd in SlaveDevices)
             {
-                var outFilter = $"ethercat/{sd.GetCsa()}/+/+";
+                var outFilter = $"{Parsed.Topic}/{sd.GetCsa()}/+/+";
                 await MqttClient.SubscribeAsync(
                     new MqttClientSubscribeOptionsBuilder()
                         .WithTopicFilter(outFilter, MqttQualityOfServiceLevel.AtLeastOnce)
