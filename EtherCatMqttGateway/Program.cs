@@ -90,6 +90,7 @@ namespace EtherCatMqttGateway
         private static readonly ConcurrentQueue<WriteRequest> PendingWrites = new();
 
         private static ILogger Logger = default!;
+        private static ILogger EcMasterLogger = default!;
         private static EcMaster Master = default!;
         private static List<SlaveDevice> SlaveDevices = new();
         private static IMqttClient? MqttClient;
@@ -123,6 +124,7 @@ namespace EtherCatMqttGateway
                             });
                     });
                     Logger = loggerFactory.CreateLogger("EtherCatMqttGateway");
+                    EcMasterLogger = loggerFactory.CreateLogger("EtherCAT.NET");
 
                     try
                     {
@@ -197,7 +199,7 @@ namespace EtherCatMqttGateway
 
             Logger.LogInformation("Discovered {Count} slaves", allSlaves.Count);
 
-            Master = new EcMaster(settings);
+            Master = new EcMaster(settings, EcMasterLogger);
 
             Logger.LogInformation("Configuring EtherCAT master (this may take a few seconds)");
 
