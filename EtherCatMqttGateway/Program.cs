@@ -55,6 +55,10 @@ namespace EtherCatMqttGateway
         [Option("retain", Required = false, Default = false, HelpText = "Retain process-data messages.")]
         public bool RetainProcessData { get; set; }
 
+        /// <summary>Do not publish the output process data (default: false).</summary>
+        [Option("no-output", Required = false, Default = false, HelpText = "Do not publish the output process data.")]
+        public bool NoOutput { get; set; }
+
         /// <summary>Verbose logging (Information).</summary>
         [Option('v', "verbose", Required = false, Default = false, HelpText = "Verbose logging (Information).")]
         public bool Verbose { get; set; }
@@ -81,6 +85,7 @@ namespace EtherCatMqttGateway
             string? EsiDir,
             uint FrequencyHz,
             bool RetainProcessData,
+            bool NoPublishOutputs,
             LogLevel LogLevel);
 
         private sealed record WriteRequest(ushort Csa, ushort Index, byte SubIndex, JToken Value);
@@ -172,6 +177,7 @@ namespace EtherCatMqttGateway
                 EsiDir: cli.EsiDir,
                 FrequencyHz: cli.FrequencyHz,
                 RetainProcessData: cli.RetainProcessData,
+                NoPublishOutputs: cli.NoOutput,
                 LogLevel: level
             );
         }
@@ -364,13 +370,16 @@ namespace EtherCatMqttGateway
                         Master.UpdateIO(DateTime.UtcNow);
 
                         foreach (var sd in SlaveDevices)
-                            foreach (var v in sd.GetAllVariables())
+                        {
+                            var allVars = Parsed.NoPublishOutputs ? sd.GetInputVariables() : sd.GetAllVariables();
+                            foreach (var v in allVars)
                             {
                                 if (v.DataType <= 0) continue;
                                 var topic = $"{Parsed.Topic}/{sd.GetCsa()}/{v.Index:X4}/{v.SubIndex:X2}";
                                 var value = sd.ReadVariableAsJToken(v);
                                 snapshot.Add((topic, value));
                             }
+                        }
                     }
 
                     // Publish MQTT outside the lock.
