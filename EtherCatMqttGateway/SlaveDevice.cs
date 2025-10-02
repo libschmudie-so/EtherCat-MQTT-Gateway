@@ -37,9 +37,11 @@ public class SlaveDevice
     public string GetName() => _slaveInfo.DynamicData.Name;
 
     /// <summary>
-    /// Controller Station Address used for MQTT topics (ring index supplied by the controller).
+    /// CSA (ring index) for this slave; may differ from reported CSA.
     /// </summary>
-    public ushort GetCsa() => _slaveIndex;
+    /// <param name="useReportedCsa">If true, returns the CSA reported by the EtherCAT stack instead of the ring index.</param>
+    /// <returns>CSA as ushort.</returns>
+    public ushort GetCsa(bool useReportedCsa = false) => useReportedCsa ? _slaveInfo.Csa : _slaveIndex;
 
     /// <summary>
     /// CSA reported by the EtherCAT stack (may or may not match ring index).
