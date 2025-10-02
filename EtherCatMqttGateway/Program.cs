@@ -70,6 +70,14 @@ namespace EtherCatMqttGateway
         /// <summary>Debug logging.</summary>
         [Option("debug", Required = false, Default = false, HelpText = "Debug logging.")]
         public bool Debug { get; set; }
+
+        /// <summary>MQTT client ID (default: EtherCATMaster).</summary>
+        [Option("client-id", Required = false, Default = "EtherCATMaster", HelpText = "MQTT client ID.")]
+        public string ClientId { get; set; } = "EtherCATMaster";
+
+        /// <summary>Use reported CSA instead of ring CSA for MQTT topics (default: false).</summary>
+        [Option("use-reported-csa", Required = false, Default = false, HelpText = "Use reported CSA instead of ring CSA for MQTT topics.")]
+        public bool UseReportedCsa { get; set; }
     }
 
     /// <summary>
@@ -86,7 +94,9 @@ namespace EtherCatMqttGateway
             uint FrequencyHz,
             bool RetainProcessData,
             bool NoPublishOutputs,
-            LogLevel LogLevel);
+            LogLevel LogLevel,
+            string ClientId,
+            bool UseReportedCsa);
 
         private sealed record WriteRequest(ushort Csa, ushort Index, byte SubIndex, JToken Value);
 
@@ -178,7 +188,9 @@ namespace EtherCatMqttGateway
                 FrequencyHz: cli.FrequencyHz,
                 RetainProcessData: cli.RetainProcessData,
                 NoPublishOutputs: cli.NoOutput,
-                LogLevel: level
+                LogLevel: level,
+                ClientId: cli.ClientId,
+                UseReportedCsa: cli.UseReportedCsa
             );
         }
 
@@ -188,8 +200,8 @@ namespace EtherCatMqttGateway
         private static async Task<int> RunAsync()
         {
             Logger.LogInformation("Starting EtherCatMqttGateway");
-            Logger.LogInformation("Interface={Interface} Broker={Broker}:{Port} ESI={EsiDir} Freq={FreqHz}Hz RetainProcessData={Retain} RootTopic={Topic}",
-                Parsed.Interface, Parsed.Broker, Parsed.Port, Parsed.EsiDir ?? "<default>", Parsed.FrequencyHz, Parsed.RetainProcessData, Parsed.Topic);
+            Logger.LogInformation("Interface={Interface} Broker={Broker}:{Port} ESI={EsiDir} Freq={FreqHz}Hz RetainProcessData={Retain} RootTopic={Topic} ClientId={ClientId} UseReportedCsa={UseReportedCsa}",
+                Parsed.Interface, Parsed.Broker, Parsed.Port, Parsed.EsiDir ?? "<default>", Parsed.FrequencyHz, Parsed.RetainProcessData, Parsed.Topic, Parsed.ClientId, Parsed.UseReportedCsa);
 
             var esiDirectoryPath = Parsed.EsiDir ?? Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ESI");
@@ -226,7 +238,7 @@ namespace EtherCatMqttGateway
             MqttClient = factory.CreateMqttClient();
 
             var mqttOptions = new MqttClientOptionsBuilder()
-                .WithClientId("EtherCATMaster")
+                .WithClientId(Parsed.ClientId)
                 .WithTcpServer(Parsed.Broker, Parsed.Port)
                 .WithCleanSession(false)
                 .WithWillTopic($"{Parsed.Topic}/bridge/status")
@@ -288,7 +300,7 @@ namespace EtherCatMqttGateway
             // Publish static metadata and subscribe to per-slave wildcard output topics.
             foreach (var sd in SlaveDevices)
             {
-                var metaTopic = $"{Parsed.Topic}/{sd.GetCsa()}/metadata";
+                var metaTopic = $"{Parsed.Topic}/{sd.GetCsa(Parsed.UseReportedCsa)}/metadata";
                 var slaveMeta = sd.GetMetadata();
                 var metaPayload = slaveMeta.ToString();
 
@@ -300,7 +312,7 @@ namespace EtherCatMqttGateway
                     .Build();
                 await MqttClient.PublishAsync(msg);
 
-                var outFilter = $"{Parsed.Topic}/{sd.GetCsa()}/+/+";
+                var outFilter = $"{Parsed.Topic}/{sd.GetCsa(Parsed.UseReportedCsa)}/+/+";
                 await MqttClient.SubscribeAsync(
                     new MqttClientSubscribeOptionsBuilder()
                         .WithTopicFilter(outFilter, MqttQualityOfServiceLevel.AtLeastOnce)
@@ -309,7 +321,9 @@ namespace EtherCatMqttGateway
                 slaveSummary[sd.GetCsa().ToString()] = new JObject
                 {
                     ["name"] = slaveMeta["name"],
-                    ["description"] = slaveMeta["description"]
+                    ["description"] = slaveMeta["description"],
+                    ["reportedCsa"] = slaveMeta["reportedCsa"],
+                    ["ringCsa"] = slaveMeta["ringCsa"]
                 };
             }
 
@@ -320,6 +334,7 @@ namespace EtherCatMqttGateway
                 ["frequency_hz"] = Parsed.FrequencyHz,
                 ["esi_path"] = esiDirectoryPath,
                 ["started_utc"] = DateTime.UtcNow,
+                ["topic_csa_mode"] = Parsed.UseReportedCsa ? "reportedCsa" : "ringCsa",
                 ["slaves"] = slaveSummary
             };
             await PublishJsonAsync($"{Parsed.Topic}/bridge/info", info, retain: true);
@@ -347,7 +362,7 @@ namespace EtherCatMqttGateway
                         // Apply queued writes from MQTT.
                         while (PendingWrites.TryDequeue(out var req))
                         {
-                            var sd = SlaveDevices.FirstOrDefault(x => x.GetCsa() == req.Csa);
+                            var sd = SlaveDevices.FirstOrDefault(x => x.GetCsa(Parsed.UseReportedCsa) == req.Csa);
                             if (sd == null) continue;
 
                             var varDesc = sd.GetOutputVariables()
@@ -375,7 +390,7 @@ namespace EtherCatMqttGateway
                             foreach (var v in allVars)
                             {
                                 if (v.DataType <= 0) continue;
-                                var topic = $"{Parsed.Topic}/{sd.GetCsa()}/{v.Index:X4}/{v.SubIndex:X2}";
+                                var topic = $"{Parsed.Topic}/{sd.GetCsa(Parsed.UseReportedCsa)}/{v.Index:X4}/{v.SubIndex:X2}";
                                 var value = sd.ReadVariableAsJToken(v);
                                 snapshot.Add((topic, value));
                             }
@@ -478,7 +493,7 @@ namespace EtherCatMqttGateway
                 return Task.CompletedTask;
             }
 
-            var sd = SlaveDevices.FirstOrDefault(x => x.GetCsa() == csa);
+            var sd = SlaveDevices.FirstOrDefault(x => x.GetCsa(Parsed.UseReportedCsa) == csa);
             if (sd == null) return Task.CompletedTask;
 
             // Validate that this variable is an output before accepting writes.
@@ -552,7 +567,7 @@ namespace EtherCatMqttGateway
 
             foreach (var sd in SlaveDevices)
             {
-                var outFilter = $"{Parsed.Topic}/{sd.GetCsa()}/+/+";
+                var outFilter = $"{Parsed.Topic}/{sd.GetCsa(Parsed.UseReportedCsa)}/+/+";
                 await MqttClient.SubscribeAsync(
                     new MqttClientSubscribeOptionsBuilder()
                         .WithTopicFilter(outFilter, MqttQualityOfServiceLevel.AtLeastOnce)
