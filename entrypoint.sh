@@ -37,7 +37,7 @@ NO_OUTPUT_OPT=""
 CSA_OPT=""
 [ "$USE_REPORTED_CSA" = "true" ] && CSA_OPT="--use-reported-csa"
 
-exec dotnet EtherCatMqttGateway.dll \
+exec ./ethercat-mqtt-gateway \
   --iface "$IFACE" \
   --broker "$BROKER" \
   --port "$PORT" \

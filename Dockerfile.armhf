@@ -1,0 +1,187 @@
+# Cross-compiles ethercat-mqtt-gateway for armhf (32-bit ARM, hard-float) as a
+# single, fully static binary (-static): no libmosquitto.so, libtinyxml2.so,
+# libspdlog.so, libstdc++.so, or even libc.so needed on the target device --
+# just copy the binary over and run it.
+#
+# Build (SOEM backend, default):
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.armhf -o dist .
+#   -> dist/ethercat-mqtt-gateway
+#
+# Build the IGH (Etherlab) backend instead:
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.armhf --build-arg EC_BACKEND=igh -o dist .
+#
+# Or without buildkit's -o (any docker version):
+#   docker build -f Dockerfile.armhf --build-arg EC_BACKEND=soem -t ecmqtt-armhf-builder .
+#   docker create --name tmp --entrypoint /ethercat-mqtt-gateway ecmqtt-armhf-builder && \
+#     docker cp tmp:/ethercat-mqtt-gateway . && docker rm tmp
+#
+# Notes:
+#   - IGH here is the userspace library only (libethercat, cross-built
+#     statically from source with --disable-kernel). The IGH kernel module is
+#     inherently tied to a specific target kernel + NIC driver and can't be
+#     cross-built generically -- you still need to build and load that
+#     separately on the target device itself; see
+#     https://gitlab.com/etherlab.org/ethercat. This image only gets you the
+#     application binary linked against the userspace side of the API.
+#   - MQTT TLS is OFF (WITH_TLS=OFF) to avoid also cross-building a static
+#     OpenSSL. If you need mqtts/8883, cross-build OpenSSL for armhf first
+#     (`Configure linux-armv4 no-shared --cross-compile-prefix=arm-linux-gnueabihf-
+#     --prefix=/opt/armhf-sysroot`, `make install_sw`), then flip WITH_TLS=ON
+#     below and add -lssl -lcrypto to the final link step.
+#   - A fully static glibc binary loses NSS-plugin-based name resolution
+#     (LDAP/mDNS/winbind hosts lookups); plain DNS via /etc/resolv.conf and
+#     numeric IPs both still work fine, which covers the vast majority of
+#     MQTT broker addresses. If you need NSS plugins, drop -static from the
+#     final link step for a mostly-static (dynamic glibc only) binary.
+
+# Global scope: only used to pick which app-build-* stage the final export
+# copies from (COPY --from= can't take a variable directly; FROM can).
+ARG EC_BACKEND=soem
+
+# ============================================================================
+# Common cross toolchain + shared static dependencies (mosquitto, tinyxml2,
+# spdlog), independent of which EtherCAT backend is selected.
+# ============================================================================
+FROM debian:trixie-slim AS deps
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    crossbuild-essential-armhf \
+    cmake git ca-certificates pkg-config make \
+    autoconf automake libtool \
+    nlohmann-json3-dev libcxxopts-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV SYSROOT=/opt/armhf-sysroot
+# Cross pkg-config setup: only ever look inside our armhf sysroot, never the
+# host's amd64 .pc files.
+ENV PKG_CONFIG_LIBDIR=${SYSROOT}/lib/pkgconfig
+ENV PKG_CONFIG_PATH=
+ENV PKG_CONFIG_SYSROOT_DIR=${SYSROOT}
+ENV TOOLCHAIN_FILE=/build/src/cmake/toolchain-armhf.cmake
+
+# Needed by the dependency builds below too, so copy it in before COPY src/
+# (which happens later, closer to the final build step, for better layer
+# caching when only application source changes).
+COPY src/cmake/toolchain-armhf.cmake /tmp/toolchain-armhf.cmake
+
+# --- tinyxml2 (static) ---------------------------------------------------
+RUN git clone --depth 1 --branch 11.0.0 https://github.com/leethomason/tinyxml2.git /tmp/tinyxml2 \
+ && cmake -S /tmp/tinyxml2 -B /tmp/tinyxml2/build \
+    -DCMAKE_TOOLCHAIN_FILE=/tmp/toolchain-armhf.cmake \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_SHARED_LIBS=OFF \
+    -Dtinyxml2_BUILD_TESTING=OFF \
+    -DCMAKE_INSTALL_PREFIX=${SYSROOT} \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+ && cmake --build /tmp/tinyxml2/build -j"$(nproc)" \
+ && cmake --install /tmp/tinyxml2/build \
+ && rm -rf /tmp/tinyxml2
+
+# --- spdlog (static, bundled fmt) ----------------------------------------
+RUN git clone --depth 1 --recurse-submodules --shallow-submodules \
+    --branch v1.17.0 https://github.com/gabime/spdlog.git /tmp/spdlog \
+ && cmake -S /tmp/spdlog -B /tmp/spdlog/build \
+    -DCMAKE_TOOLCHAIN_FILE=/tmp/toolchain-armhf.cmake \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DSPDLOG_BUILD_SHARED=OFF \
+    -DSPDLOG_BUILD_EXAMPLE=OFF \
+    -DSPDLOG_BUILD_TESTS=OFF \
+    -DSPDLOG_INSTALL=ON \
+    -DCMAKE_INSTALL_PREFIX=${SYSROOT} \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+ && cmake --build /tmp/spdlog/build -j"$(nproc)" \
+ && cmake --install /tmp/spdlog/build \
+ && rm -rf /tmp/spdlog
+
+# --- libmosquitto client (static, no TLS, no cJSON/broker/clients) ------
+RUN git clone --depth 1 --branch v2.0.21 https://github.com/eclipse/mosquitto.git /tmp/mosquitto \
+ && cmake -S /tmp/mosquitto -B /tmp/mosquitto/build \
+    -DCMAKE_TOOLCHAIN_FILE=/tmp/toolchain-armhf.cmake \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DWITH_STATIC_LIBRARIES=ON \
+    -DWITH_PIC=OFF \
+    -DWITH_LIB_CPP=OFF \
+    -DWITH_TLS=OFF \
+    -DWITH_CJSON=OFF \
+    -DWITH_CLIENTS=OFF \
+    -DWITH_BROKER=OFF \
+    -DWITH_APPS=OFF \
+    -DWITH_PLUGINS=OFF \
+    -DDOCUMENTATION=OFF \
+    -DCMAKE_INSTALL_PREFIX=${SYSROOT} \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+ && cmake --build /tmp/mosquitto/build -j"$(nproc)" \
+ && cmake --install /tmp/mosquitto/build \
+ # The generated libmosquitto.pc's "Libs: -lmosquitto" refers to the shared
+ # library name; point it at our static archive instead so pkg-config-driven
+ # linking picks up the static build.
+ && rm -f ${SYSROOT}/lib/libmosquitto.so* \
+ && cp ${SYSROOT}/lib/libmosquitto_static.a ${SYSROOT}/lib/libmosquitto.a \
+ && rm -rf /tmp/mosquitto
+
+# ============================================================================
+# Backend-specific stages. Only the one matching --build-arg EC_BACKEND is
+# ever actually built (Docker only executes stages reachable from the final
+# FROM below), so picking SOEM never requires autotools/IGH sources at all.
+# ============================================================================
+
+# SOEM needs no extra prep here: it's fetched by our own CMakeLists.txt via
+# FetchContent during the application build itself (see src/CMakeLists.txt).
+FROM deps AS backend-soem
+
+# IGH: cross-build just the userspace library (libethercat + ecrt.h),
+# skipping the kernel module (--disable-kernel) which is inherently
+# target-kernel-specific and out of scope for a generic cross-compile image.
+FROM deps AS backend-igh
+RUN git clone --depth 1 --branch 1.6.10 https://gitlab.com/etherlab.org/ethercat.git /tmp/ethercat \
+ && cd /tmp/ethercat \
+ && ./bootstrap \
+ && ./configure \
+    --host=arm-linux-gnueabihf \
+    CC=arm-linux-gnueabihf-gcc \
+    CXX=arm-linux-gnueabihf-g++ \
+    --disable-kernel \
+    --disable-tool \
+    --enable-userlib \
+    --disable-shared \
+    --enable-static \
+    --prefix=${SYSROOT} \
+ && make -j"$(nproc)" \
+ && make install \
+ && rm -rf /tmp/ethercat
+
+# ============================================================================
+# Application build. Docker's FROM-with-variable resolution requires a
+# lowercase image/stage name, so backend selection for the Docker stage
+# (--build-arg EC_BACKEND=soem|igh) is lowercase while the value handed to
+# our CMakeLists.txt's EC_BACKEND option (which expects SOEM|IGH) is fixed
+# per stage below rather than threaded through as a variable.
+# ============================================================================
+FROM backend-soem AS app-build-soem
+COPY src/ /build/src/
+RUN cmake -S /build/src -B /build/build \
+      -DCMAKE_TOOLCHAIN_FILE=${TOOLCHAIN_FILE} \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DEC_BACKEND=SOEM \
+      -DCMAKE_EXE_LINKER_FLAGS="-static" \
+ && cmake --build /build/build -j"$(nproc)" \
+ && arm-linux-gnueabihf-strip /build/build/ethercat-mqtt-gateway \
+ && cp /build/build/ethercat-mqtt-gateway /ethercat-mqtt-gateway
+
+FROM backend-igh AS app-build-igh
+COPY src/ /build/src/
+RUN cmake -S /build/src -B /build/build \
+      -DCMAKE_TOOLCHAIN_FILE=${TOOLCHAIN_FILE} \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DEC_BACKEND=IGH \
+      -DIGH_INCLUDE_DIR=${SYSROOT}/include \
+      -DIGH_LIBRARY=${SYSROOT}/lib/libethercat.a \
+      -DCMAKE_EXE_LINKER_FLAGS="-static" \
+ && cmake --build /build/build -j"$(nproc)" \
+ && arm-linux-gnueabihf-strip /build/build/ethercat-mqtt-gateway \
+ && cp /build/build/ethercat-mqtt-gateway /ethercat-mqtt-gateway
+
+FROM app-build-${EC_BACKEND} AS app-build-selected
+
+FROM scratch AS export
+COPY --from=app-build-selected /ethercat-mqtt-gateway /ethercat-mqtt-gateway

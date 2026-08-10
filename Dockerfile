@@ -1,27 +1,27 @@
 # Build stage
-FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+FROM debian:trixie-slim AS build
 WORKDIR /src
 
-# copy csproj and restore as distinct layers
-COPY EtherCatMqttGateway/*.csproj ./EtherCatMqttGateway/
-RUN dotnet restore EtherCatMqttGateway/*.csproj
-
-# copy everything and build
-COPY . .
-WORKDIR /src/EtherCatMqttGateway
-RUN dotnet publish -c Release -o /app
-
-# Runtime stage
-FROM mcr.microsoft.com/dotnet/runtime:8.0 AS runtime
-WORKDIR /app
-
-# EtherCAT master requires access to raw network devices
-# Add libpcap (needed by EtherCAT.NET in most cases)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpcap0.8 \
+    cmake g++ git ca-certificates pkg-config \
+    nlohmann-json3-dev libspdlog-dev libcxxopts-dev libtinyxml2-dev libmosquitto-dev \
  && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /app ./
+COPY src/ ./src/
+RUN cmake -B build -S src -DCMAKE_BUILD_TYPE=Release -DEC_BACKEND=SOEM \
+ && cmake --build build -j"$(nproc)"
+
+# Runtime stage
+FROM debian:trixie-slim AS runtime
+WORKDIR /app
+
+# EtherCAT (SOEM) needs raw socket access; the MQTT/JSON/XML/logging libs
+# below are the runtime counterparts of the -dev packages used to build.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libmosquitto1 libtinyxml2-11 libspdlog1.15 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /src/build/ethercat-mqtt-gateway ./
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

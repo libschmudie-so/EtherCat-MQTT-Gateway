@@ -1,6 +1,6 @@
 # EtherCatMqttGateway
 
-An EtherCAT ⇄ MQTT bridge implemented in C#.
+An EtherCAT ⇄ MQTT bridge implemented in C++.
 It scans an EtherCAT ring, configures slaves, and exposes process data variables over MQTT topics.
 Process data can be monitored and written through MQTT, enabling integration with automation systems and IoT platforms.
 
@@ -8,8 +8,8 @@ Process data can be monitored and written through MQTT, enabling integration wit
 
 ## Features
 
-* EtherCAT master using [EtherCAT.NET](https://github.com/)
-* Automatic slave scan and PDO mapping from ESI XMLs
+* EtherCAT master via **SOEM** or **IGH (Etherlab) master**, selected at compile time (`-DEC_BACKEND=SOEM|IGH`)
+* Automatic slave scan and PDO mapping, cross-referenced with ESI XMLs for human-readable names/types
 * Publishes process data to MQTT topics
 * Subscribes to output variables for remote control
 * Metadata publishing for each slave
@@ -26,23 +26,47 @@ Process data can be monitored and written through MQTT, enabling integration wit
 .
 ├── Dockerfile
 ├── entrypoint.sh
-└── EtherCatMqttGateway
-   ├── EtherCatMqttGateway.csproj
-   ├── Program.cs
-   └── SlaveDevice.cs
+└── src
+    ├── CMakeLists.txt
+    ├── include/ecmqtt/       # public headers (config, backend interface, ESI, MQTT, slave device)
+    └── src/
+        ├── main.cpp          # wiring + cycle loop
+        ├── config.cpp        # CLI parsing (cxxopts)
+        ├── logging.cpp       # spdlog setup
+        ├── esi_repository.cpp   # ESI XML parsing (tinyxml2)
+        ├── slave_device.cpp     # bit-level read/write + JSON conversion
+        ├── mqtt_client.cpp      # libmosquitto wrapper
+        └── backends/
+            ├── soem_backend.cpp  # compiled iff EC_BACKEND=SOEM
+            └── igh_backend.cpp   # compiled iff EC_BACKEND=IGH
 ```
 
 ---
 
 ## Building
 
-Build locally with the .NET SDK:
+### Dependencies
+
+Install via apt (Debian/Ubuntu):
 
 ```sh
-dotnet publish -c Release EtherCatMqttGateway/EtherCatMqttGateway.csproj -o out
+sudo apt-get install cmake g++ pkg-config \
+  nlohmann-json3-dev libspdlog-dev libcxxopts-dev libtinyxml2-dev libmosquitto-dev
 ```
 
-Or build a Docker image:
+The **SOEM** backend (default) is fetched and built automatically via CMake `FetchContent` — no extra install needed.
+
+The **IGH (Etherlab) master** backend requires a matching kernel module and userspace library already built and installed on the machine (it can't be fetched generically since it's tied to your NIC driver) — see https://gitlab.com/etherlab.org/ethercat. CMake looks for `ecrt.h`/`libethercat` under `/usr/local` or `/opt/etherlab` by default; override with `-DIGH_INCLUDE_DIR=...` / `-DIGH_LIBRARY=...` if installed elsewhere.
+
+### Build
+
+```sh
+cmake -B build -S src -DCMAKE_BUILD_TYPE=Release -DEC_BACKEND=SOEM
+cmake --build build -j"$(nproc)"
+# binary: build/ethercat-mqtt-gateway
+```
+
+Or build a Docker image (SOEM backend):
 
 ```sh
 docker build -t ethercat-mqtt .
@@ -114,7 +138,7 @@ pipework enx207bd22c6b91 <container_id> 0.0.0.0/24
 Run inside container or natively:
 
 ```sh
-dotnet EtherCatMqttGateway.dll \
+./ethercat-mqtt-gateway \
   --iface eth0 \
   --broker 192.168.1.100 \
   --port 1883 \
@@ -141,5 +165,5 @@ dotnet EtherCatMqttGateway.dll \
 
 ## Notes
 
-* ESI XML files must be present in the configured ESI directory.
-* The container requires `CAP_NET_RAW` and `CAP_NET_ADMIN` to access EtherCAT interfaces **if pipework/macvlan is not used** (e.g. with host networking).
+* ESI XML files must be present in the configured ESI directory for slaves/PDOs to get human-readable names; without a match, entries fall back to numeric `Index:SubIndex` names.
+* The container requires `CAP_NET_RAW` and `CAP_NET_ADMIN` to access EtherCAT interfaces **if pipework/macvlan is not used** (e.g. with host networking). This applies to the SOEM backend; the IGH backend instead requires its kernel module to be loaded on the host.
