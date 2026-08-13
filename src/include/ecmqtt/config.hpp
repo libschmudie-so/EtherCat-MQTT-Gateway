@@ -3,8 +3,11 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <spdlog/common.h>
+
+#include "ecmqtt/pdo_override.hpp"
 
 namespace ecmqtt {
 
@@ -19,6 +22,9 @@ struct Config {
     bool noPublishOutputs = false;
     spdlog::level::level_enum logLevel = spdlog::level::info;
     std::string clientId = "EtherCATMaster";
+    // Use each slave's persistent SII "Configured Station Alias" (falls back
+    // to ring position for slaves with none set) instead of ring position
+    // for MQTT topics -- see --write-alias for how to set one.
     bool useReportedCsa = false;
     // Opt-in: requests SCHED_FIFO + mlockall for the cycle thread. Off by
     // default -- on some systems (seen on a Beckhoff CX9020) a hardcoded
@@ -26,6 +32,27 @@ struct Config {
     // EtherCAT master thread or NIC packet processing instead of helping,
     // so this needs to be validated per-system rather than assumed safe.
     bool realtime = false;
+
+    // Raw --pdo-config path, if given; main.cpp loads it and resolves entry
+    // content from ESI into pdoOverrides before calling backend->configure().
+    std::optional<std::string> pdoConfigPath;
+    std::vector<PdoOverride> pdoOverrides;
+
+    // Raw --write-alias spec, if given ("<ringPos>=<alias>[,...]"). Presence
+    // of this switches main() into a standalone alias-write tool mode that
+    // exits immediately after, instead of running the bridge.
+    std::optional<std::string> writeAlias;
+
+    // Opt-in: periodically checks for a live topology change (slaves
+    // hot-plugged/removed) and reconfigures to pick it up, republishing
+    // MQTT metadata for the current slave set. Off by default since it has
+    // a real cost even when nothing changes (periodic polling) and, when a
+    // change IS detected, briefly pauses cyclic servicing for every slave
+    // (not just the one that changed) while reconfiguring -- see
+    // IEtherCatBackend::reconfigure(). Only IGH supports this; ignored with
+    // a warning on backends where IEtherCatBackend::supportsHotplug() is
+    // false.
+    bool hotplug = false;
 };
 
 // Parses argv via cxxopts into a validated Config.

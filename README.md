@@ -152,6 +152,42 @@ Run inside container or natively:
   --debug
 ```
 
+`--use-reported-csa` uses each slave's persistent SII "Configured Station Alias" for its MQTT topic instead of its ring position, so the topic survives the slave being moved to a different port -- see `--write-alias` below to set one. Slaves with no alias set fall back to ring position.
+
+### Non-default PDO assignment (`--pdo-config`)
+
+Some terminals declare more than one PDO set in their ESI file (e.g. "Standard"/"Compact"/"Enhanced" variants) but come up using the default one. `--pdo-config <file.json>` selects a different one per device (matched by vendor/product/revision, not ring position):
+
+```json
+{
+  "overrides": [
+    {
+      "vendorId": "#x2", "productCode": "#x10883052", "revisionNo": "#x110000",
+      "rxPdo": ["#x1601"],
+      "txPdo": ["#x1a02"]
+    }
+  ]
+}
+```
+
+`rxPdo`/`txPdo` list the PDO indices (as declared in that device's ESI `<RxPdo>`/`<TxPdo>` blocks) to assign instead of the default; omit either to leave that direction alone. Requires the device's ESI file to be present in `--esi`.
+
+### Setting a persistent slave alias (`--write-alias`)
+
+**SOEM builds only** -- IGH's userspace library has no SII/EEPROM write API; on IGH targets use the target's own `ethercat alias -pPOSITION VALUE` tool instead (part of the standard IGH master install), then power-cycle the slave.
+
+```sh
+./ethercat-mqtt-gateway --iface eth0 --write-alias "3=100"
+```
+
+Writes alias `100` to the slave currently at ring position 3, then exits without running the bridge. **Power-cycle that slave** afterward -- the alias is latched by the EtherCAT slave controller at reset, not applied live. Once set, `--use-reported-csa` will address it by that alias regardless of where it sits in the ring -- handy for replacing a broken card: write the same alias to its replacement and the MQTT topic doesn't change. Multiple slaves can be set in one call: `--write-alias "1=100,2=101"`.
+
+### Hot-plug / hot-unplug (`--hotplug`, IGH only)
+
+`--hotplug` periodically checks whether the slaves physically present on the bus differ from what's currently configured, and reconfigures to pick up the change -- newly plugged cards get brought up and start publishing to MQTT, removed cards drop out of the active slave list (their retained MQTT topics are left as-is, not cleared).
+
+This has a real cost: IGH's own API is explicit that slave configuration can't be altered once the master is activated, so applying a change means briefly deactivating and reactivating the whole master -- **every** slave (not just the one that changed) drops cyclic servicing for the duration of the reconfigure, not just the hot-plugged one. Each reconfigure also leaks one internal domain object (IGH's public API has no call to free one); fine for occasional hot-plug events, worth knowing if they happen very frequently in your setup. Ignored with a warning on backends that don't support it (SOEM).
+
 ---
 
 ## MQTT Topics

@@ -21,9 +21,17 @@
 #include <spdlog/spdlog.h>
 
 #include "ecmqtt/ethercat_backend.hpp"
+#include "ecmqtt/pdo_override.hpp"
 
 namespace ecmqtt {
 namespace {
+
+const PdoOverride* FindOverride(const std::vector<PdoOverride>& overrides, uint32_t vendorId, uint32_t productCode,
+                                 uint32_t revisionNo) {
+    for (auto& ov : overrides)
+        if (ov.vendorId == vendorId && ov.productCode == productCode && ov.revisionNo == revisionNo) return &ov;
+    return nullptr;
+}
 
 class IghBackend final : public IEtherCatBackend {
 public:
@@ -32,8 +40,9 @@ public:
     }
 
     void configure(const Config& cfg) override {
-        (void)cfg; // IGH addresses slaves via its own preconfigured master/device, not an --iface name
-
+        // cfg.interface is unused: IGH addresses slaves via its own
+        // preconfigured master/device, not an --iface name. cfg.pdoOverrides
+        // is used below.
         master_ = ecrt_request_master(0);
         if (!master_)
             throw std::runtime_error(
@@ -42,6 +51,97 @@ public:
         domain_ = ecrt_master_create_domain(master_);
         if (!domain_) throw std::runtime_error("ecrt_master_create_domain failed");
 
+        rescan(cfg);
+    }
+
+    // ecrt_master_activate() is what starts the master expecting cyclic
+    // servicing (pending mailbox/SDO exchanges from configure()'s bus scan
+    // ride along on the cyclic exchange); call this right before the cyclic
+    // loop starts, per the base class contract.
+    void activate() override {
+        if (ecrt_master_activate(master_) != 0) throw std::runtime_error("ecrt_master_activate failed");
+
+        uint8_t* domainBase = ecrt_domain_data(domain_);
+        if (!domainBase) throw std::runtime_error("ecrt_domain_data returned null after activation");
+
+        for (const auto& p : pending_)
+            slaves_[p.slaveArrIdx].variables[p.varIdx].dataPtr = domainBase + p.byteOffset;
+        pending_.clear();
+
+        spdlog::info("IGH: master activated");
+    }
+
+    std::vector<DiscoveredSlave>& slaves() override { return slaves_; }
+
+    // IGH's documented cyclic pattern is receive -> process -> read inputs
+    // -> write outputs -> queue -> send: ecrt_master_receive()/
+    // ecrt_domain_process() refresh the whole process image (including
+    // output bytes) from the just-received frame, so a write applied before
+    // this call -- e.g. by the caller, before calling updateIO() at all --
+    // gets silently overwritten right here and never reaches ecrt_domain_
+    // queue()/ecrt_master_send(). applyWrites() has to run in between.
+    void updateIO(const std::function<void()>& applyWrites) override {
+        ecrt_master_receive(master_);
+        ecrt_domain_process(domain_);
+        applyWrites();
+        ecrt_domain_queue(domain_);
+        ecrt_master_send(master_);
+    }
+
+    void shutdown() override {
+        if (master_) ecrt_master_deactivate(master_);
+    }
+
+    bool supportsHotplug() const override { return true; }
+
+    // ecrt_master()/ecrt_master_get_slave() are documented safe to call in
+    // either master phase (idle or operational), so this can run while the
+    // cyclic loop is live -- but ecrt_master_get_slave() is "blocking", so
+    // this is meant to be polled occasionally, not from inside the
+    // real-time per-cycle section.
+    bool topologyChanged() override {
+        ec_master_info_t info{};
+        if (ecrt_master(master_, &info) != 0) return false;
+        if (info.slave_count != slaves_.size()) return true;
+
+        for (unsigned int pos = 0; pos < info.slave_count; ++pos) {
+            ec_slave_info_t si{};
+            if (ecrt_master_get_slave(master_, static_cast<uint16_t>(pos), &si) != 0)
+                return true; // can't even ask anymore -- treat as changed
+            auto& ds = slaves_[pos];
+            if (si.vendor_id != ds.vendorId || si.product_code != ds.productCode ||
+                si.revision_number != ds.revisionNo)
+                return true;
+        }
+        return false;
+    }
+
+    // See the base class doc comment for the deactivate/rescan/reactivate
+    // cost this incurs -- unavoidable given IGH's documented API contract.
+    void reconfigure(const Config& cfg) override {
+        spdlog::info("IGH: topology change detected, reconfiguring ({} slave(s) currently)...", slaves_.size());
+
+        if (ecrt_master_deactivate(master_) != 0) throw std::runtime_error("ecrt_master_deactivate failed");
+
+        slaves_.clear();
+        pending_.clear();
+
+        // No domain-free call exists in IGH's public API -- the old domain_
+        // is leaked (owned/released by the master itself, eventually, on
+        // ecrt_release_master()). Acceptable for occasional hotplug events.
+        domain_ = ecrt_master_create_domain(master_);
+        if (!domain_) throw std::runtime_error("ecrt_master_create_domain failed");
+
+        rescan(cfg);
+        activate();
+    }
+
+private:
+    // Scans the bus and (re)builds slaves_/pending_ from scratch. Must run
+    // while the master is in idle phase (before the first activate(), or
+    // just after a deactivate()) -- IGH's own docs: slave configuration
+    // can't be altered once ecrt_master_activate() has run.
+    void rescan(const Config& cfg) {
         ec_master_info_t info{};
         if (ecrt_master(master_, &info) != 0) throw std::runtime_error("ecrt_master() failed to obtain master info");
 
@@ -56,7 +156,9 @@ public:
 
             DiscoveredSlave ds;
             ds.ringCsa = static_cast<uint16_t>(pos + 1); // keep 1-based ring numbering, consistent with SOEM
-            ds.reportedCsa = ds.ringCsa; // IGH exposes no separate configured-station-address concept
+            // slaveInfo.alias is the persistent SII "Configured Station
+            // Alias" (0 if never set); falls back to ring position.
+            ds.reportedCsa = slaveInfo.alias != 0 ? slaveInfo.alias : ds.ringCsa;
             ds.vendorId = slaveInfo.vendor_id;
             ds.productCode = slaveInfo.product_code;
             ds.revisionNo = slaveInfo.revision_number;
@@ -70,12 +172,73 @@ public:
                 continue;
             }
 
+            const PdoOverride* ov =
+                cfg.pdoOverrides.empty() ? nullptr
+                                          : FindOverride(cfg.pdoOverrides, slaveInfo.vendor_id, slaveInfo.product_code,
+                                                          slaveInfo.revision_number);
+
             for (uint8_t syncIdx = 0; syncIdx < slaveInfo.sync_count; ++syncIdx) {
                 ec_sync_info_t sync{};
                 if (ecrt_master_get_sync_manager(master_, static_cast<uint16_t>(pos), syncIdx, &sync) != 0) continue;
                 if (sync.dir != EC_DIR_OUTPUT && sync.dir != EC_DIR_INPUT) continue; // mailbox SMs etc.
 
                 DataDirection dir = (sync.dir == EC_DIR_OUTPUT) ? DataDirection::Output : DataDirection::Input;
+
+                const std::vector<PdoOverridePdo>* overridePdos =
+                    ov ? (dir == DataDirection::Output ? &ov->rxPdos : &ov->txPdos) : nullptr;
+                if (overridePdos && !overridePdos->empty()) {
+                    // A custom assignment was requested for this direction.
+                    // ecrt_master_get_pdo/_pdo_entry below reflect what's
+                    // live *right now*, not our override (that only lands on
+                    // the wire later, during the master's own state-
+                    // transition sequence around activation) -- so build our
+                    // own PDO/entry arrays from the override (already
+                    // resolved against ESI by main.cpp) and hand them
+                    // straight to ecrt_slave_config_pdos(), which both
+                    // configures the SM's CoE assignment for us and makes
+                    // exactly these entries available for registration.
+                    std::vector<std::vector<ec_pdo_entry_info_t>> entryStorage(overridePdos->size());
+                    std::vector<ec_pdo_info_t> pdoInfos(overridePdos->size());
+                    for (size_t i = 0; i < overridePdos->size(); ++i) {
+                        for (auto& e : (*overridePdos)[i].entries)
+                            entryStorage[i].push_back({e.index, e.subIndex, static_cast<uint8_t>(e.bitLen)});
+                        pdoInfos[i] = {(*overridePdos)[i].pdoIndex, static_cast<unsigned int>(entryStorage[i].size()),
+                                       entryStorage[i].empty() ? nullptr : entryStorage[i].data()};
+                    }
+                    ec_sync_info_t syncCfg{syncIdx, sync.dir, static_cast<unsigned int>(pdoInfos.size()),
+                                           pdoInfos.data(), EC_WD_DEFAULT};
+
+                    if (ecrt_slave_config_pdos(sc, 1, &syncCfg) != 0) {
+                        spdlog::warn("IGH: failed to apply custom PDO assignment on slave {} sync {}", pos, syncIdx);
+                    } else {
+                        for (unsigned int pdoPos = 0; pdoPos < entryStorage.size(); ++pdoPos) {
+                            for (unsigned int entryPos = 0; entryPos < entryStorage[pdoPos].size(); ++entryPos) {
+                                auto& e = entryStorage[pdoPos][entryPos];
+                                if (e.bit_length == 0 || e.index == 0) continue;
+
+                                unsigned int bitPosition = 0;
+                                int byteOffset = ecrt_slave_config_reg_pdo_entry_pos(sc, syncIdx, pdoPos, entryPos,
+                                                                                      domain_, &bitPosition);
+                                if (byteOffset < 0) {
+                                    spdlog::warn("IGH: failed to register overridden PDO entry {:#06x}:{} on slave {}",
+                                                 e.index, e.subindex, pos);
+                                    continue;
+                                }
+
+                                SlaveVariable v;
+                                v.index = e.index;
+                                v.subIndex = e.subindex;
+                                v.bitLength = e.bit_length;
+                                v.bitOffset = static_cast<uint8_t>(bitPosition);
+                                v.direction = dir;
+                                v.dataType = GuessDataTypeFromBitLength(e.bit_length);
+                                ds.variables.push_back(v);
+                                pending_.push_back({slaves_.size(), ds.variables.size() - 1, byteOffset});
+                            }
+                        }
+                    }
+                    continue; // this sync manager is fully handled by the override
+                }
 
                 for (unsigned int pdoPos = 0; pdoPos < sync.n_pdos; ++pdoPos) {
                     ec_pdo_info_t pdo{};
@@ -120,37 +283,6 @@ public:
         spdlog::info("IGH: {} slave(s) discovered and registered", slaves_.size());
     }
 
-    // ecrt_master_activate() is what starts the master expecting cyclic
-    // servicing (pending mailbox/SDO exchanges from configure()'s bus scan
-    // ride along on the cyclic exchange); call this right before the cyclic
-    // loop starts, per the base class contract.
-    void activate() override {
-        if (ecrt_master_activate(master_) != 0) throw std::runtime_error("ecrt_master_activate failed");
-
-        uint8_t* domainBase = ecrt_domain_data(domain_);
-        if (!domainBase) throw std::runtime_error("ecrt_domain_data returned null after activation");
-
-        for (const auto& p : pending_)
-            slaves_[p.slaveArrIdx].variables[p.varIdx].dataPtr = domainBase + p.byteOffset;
-        pending_.clear();
-
-        spdlog::info("IGH: master activated");
-    }
-
-    std::vector<DiscoveredSlave>& slaves() override { return slaves_; }
-
-    void updateIO() override {
-        ecrt_master_receive(master_);
-        ecrt_domain_process(domain_);
-        ecrt_domain_queue(domain_);
-        ecrt_master_send(master_);
-    }
-
-    void shutdown() override {
-        if (master_) ecrt_master_deactivate(master_);
-    }
-
-private:
     struct PendingOffset {
         size_t slaveArrIdx;
         size_t varIdx;

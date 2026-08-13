@@ -18,11 +18,61 @@
 #include <ethercat.h>
 
 #include "ecmqtt/ethercat_backend.hpp"
+#include "ecmqtt/pdo_override.hpp"
 
 namespace ecmqtt {
 namespace {
 
 constexpr int kIoMapSize = 4096;
+
+// Set for the duration of configure() so Po2SoConfig() (a bare C function
+// pointer -- SOEM's classic API leaves no room for a capture context) can
+// find the requested overrides. SOEM's classic API is inherently
+// single-master/global-state anyway (the whole ec_slave[] array is global),
+// so this is consistent with the rest of it.
+const std::vector<PdoOverride>* g_pdoOverrides = nullptr;
+
+// Writes a 0x1C12 (RxPDO assign) / 0x1C13 (TxPDO assign) object: clear the
+// count, write each requested PDO index, then set the new count -- the
+// standard ETG.1000.6 sequence for changing which of a slave's declared
+// PDOs are active.
+bool WritePdoAssign(uint16_t slave, uint16_t assignIndex, const std::vector<PdoOverridePdo>& pdos) {
+    uint16_t zero = 0;
+    int l = sizeof(zero);
+    if (ec_SDOwrite(slave, assignIndex, 0, FALSE, l, &zero, EC_TIMEOUTRXM) <= 0) return false;
+
+    uint8_t n = 0;
+    for (auto& pdo : pdos) {
+        ++n;
+        uint16_t idx = pdo.pdoIndex;
+        l = sizeof(idx);
+        if (ec_SDOwrite(slave, assignIndex, n, FALSE, l, &idx, EC_TIMEOUTRXM) <= 0) return false;
+    }
+    l = sizeof(n);
+    return ec_SDOwrite(slave, assignIndex, 0, FALSE, l, &n, EC_TIMEOUTRXM) > 0;
+}
+
+// SOEM's standard hook point for CoE PDO reconfiguration: ec_config_map()
+// calls this for every slave with it set, while the slave is in PRE-OP and
+// before mapping is computed from the (now possibly just-changed) PDO
+// assignment -- so a 0x1C12/0x1C13 write here is picked up automatically by
+// the normal live enumeration in EnumerateDirection() below, no other
+// change needed.
+int Po2SoConfig(uint16 slave) {
+    if (!g_pdoOverrides) return 0;
+    for (auto& ov : *g_pdoOverrides) {
+        if (ov.vendorId != ec_slave[slave].eep_man || ov.productCode != ec_slave[slave].eep_id ||
+            ov.revisionNo != ec_slave[slave].eep_rev)
+            continue;
+
+        if (!ov.rxPdos.empty() && !WritePdoAssign(slave, 0x1C12, ov.rxPdos))
+            spdlog::warn("Slave {}: failed to write custom RxPDO assignment (0x1C12)", slave);
+        if (!ov.txPdos.empty() && !WritePdoAssign(slave, 0x1C13, ov.txPdos))
+            spdlog::warn("Slave {}: failed to write custom TxPDO assignment (0x1C13)", slave);
+        break;
+    }
+    return 0;
+}
 
 bool SdoReadU16(uint16_t slave, uint16_t index, uint8_t subindex, uint16_t& outVal) {
     uint8_t buf[2] = {0, 0};
@@ -86,25 +136,56 @@ bool EnumerateDirection(uint16_t slaveIdx, uint16_t assignIndex, DataDirection d
     return true;
 }
 
-void AddOpaqueFallback(DiscoveredSlave& ds) {
-    if (ec_slave[ds.ringCsa].Obytes > 0) {
-        SlaveVariable v;
-        v.name = "raw_output";
-        v.bitLength = static_cast<uint16_t>(ec_slave[ds.ringCsa].Obytes * 8);
-        v.direction = DataDirection::Output;
-        v.dataPtr = ec_slave[ds.ringCsa].outputs;
-        v.dataType = EthercatDataType::OctetString;
-        ds.variables.push_back(v);
+// Adds a whole-buffer placeholder for one direction if that direction
+// actually has mapped bytes. main.cpp's ExpandOpaqueFromEsi() replaces this
+// with real per-entry fields (from ESI) when a match is found.
+void CalcCrc(uint8_t& crc, uint8_t b) {
+    crc ^= b;
+    for (int j = 0; j <= 7; ++j) crc = (crc & 0x80) ? static_cast<uint8_t>((crc << 1) ^ 0x07) : static_cast<uint8_t>(crc << 1);
+}
+
+// SII EEPROM checksum: CRC-8/ATM (poly 0x07, init 0xFF) over the first 7
+// words (14 bytes, the "General" category) -- ETG.2000. The slave
+// controller validates this at reset and can refuse to boot from a
+// corrupted EEPROM, so writing the alias word without recomputing this
+// leaves the slave unable to come up. Matches SOEM's own eepromtool.c
+// SIIcrc() exactly.
+uint8_t SiiCrc(const uint8_t* buf) {
+    uint8_t crc = 0xff;
+    for (int i = 0; i <= 13; ++i) CalcCrc(crc, buf[i]);
+    return crc;
+}
+
+// Reads `length` bytes starting at byte offset `start` from a slave's SII
+// EEPROM (auto-increment addressed) into buf. Mirrors SOEM's own
+// eepromtool.c eeprom_read(), including the 8-byte read-chunk path some
+// slaves require (advertised via the EC_ESTAT_R64 status bit) -- getting
+// the chunk width wrong misaligns the buffer.
+void ReadEeprom(uint16_t aiadr, uint8_t* buf, int start, int length) {
+    uint16_t estat = 0;
+    ec_APRD(aiadr, ECT_REG_EEPSTAT, sizeof(estat), &estat, EC_TIMEOUTRET);
+    estat = etohs(estat);
+
+    int ainc = (estat & EC_ESTAT_R64) ? 8 : 4;
+    for (int i = start; i < start + length; i += ainc) {
+        uint64_t b = ec_readeepromAP(aiadr, static_cast<uint16_t>(i >> 1), EC_TIMEOUTEEP);
+        for (int k = 0; k < ainc && (i + k) < start + length; ++k) buf[i + k] = static_cast<uint8_t>((b >> (8 * k)) & 0xFF);
     }
-    if (ec_slave[ds.ringCsa].Ibytes > 0) {
-        SlaveVariable v;
-        v.name = "raw_input";
-        v.bitLength = static_cast<uint16_t>(ec_slave[ds.ringCsa].Ibytes * 8);
-        v.direction = DataDirection::Input;
-        v.dataPtr = ec_slave[ds.ringCsa].inputs;
-        v.dataType = EthercatDataType::OctetString;
-        ds.variables.push_back(v);
-    }
+}
+
+void AddOpaqueFallback(DiscoveredSlave& ds, DataDirection dir) {
+    bool isOutput = dir == DataDirection::Output;
+    int bytes = isOutput ? ec_slave[ds.ringCsa].Obytes : ec_slave[ds.ringCsa].Ibytes;
+    if (bytes <= 0) return;
+
+    SlaveVariable v;
+    v.name = isOutput ? "raw_output" : "raw_input";
+    v.bitLength = static_cast<uint16_t>(bytes * 8);
+    v.direction = dir;
+    v.dataPtr = isOutput ? ec_slave[ds.ringCsa].outputs : ec_slave[ds.ringCsa].inputs;
+    v.dataType = EthercatDataType::OctetString;
+    v.opaque = true;
+    ds.variables.push_back(v);
 }
 
 class SoemBackend final : public IEtherCatBackend {
@@ -119,6 +200,10 @@ public:
             throw std::runtime_error("No EtherCAT slaves found on " + cfg.interface);
         }
 
+        g_pdoOverrides = &cfg.pdoOverrides;
+        if (!cfg.pdoOverrides.empty())
+            for (int i = 1; i <= ec_slavecount; ++i) ec_slave[i].PO2SOconfig = &Po2SoConfig;
+
         ec_config_map(ioMap_.data());
         ec_configdc();
 
@@ -128,21 +213,34 @@ public:
         for (int i = 1; i <= ec_slavecount; ++i) {
             DiscoveredSlave ds;
             ds.ringCsa = static_cast<uint16_t>(i);
-            ds.reportedCsa = ec_slave[i].configadr;
+            // ec_slave[i].configadr is just EC_NODEOFFSET + ring position --
+            // assigned sequentially at scan time, not persistent. aliasadr
+            // is the actual SII "Configured Station Alias" (0 if never set
+            // via --write-alias), which is what survives the slave moving.
+            ds.reportedCsa = ec_slave[i].aliasadr != 0 ? ec_slave[i].aliasadr : ds.ringCsa;
             ds.vendorId = ec_slave[i].eep_man;
             ds.productCode = ec_slave[i].eep_id;
             ds.revisionNo = ec_slave[i].eep_rev;
             ds.liveName = ec_slave[i].name;
 
-            bool outOk = EnumerateDirection(static_cast<uint16_t>(i), 0x1C12, DataDirection::Output,
-                                             ec_slave[i].outputs, ds.variables);
-            bool inOk = EnumerateDirection(static_cast<uint16_t>(i), 0x1C13, DataDirection::Input,
-                                            ec_slave[i].inputs, ds.variables);
+            // A direction's assign object (0x1C12/0x1C13) reading fine is not
+            // enough: some slaves report a valid assign list but their
+            // mapped PDOs (0x1600+/0x1A00+) aren't themselves readable as
+            // SDOs (fixed/hardwired, only documented in ESI, not really in
+            // the live object dictionary -- seen on Beckhoff EL2612), which
+            // silently produces zero usable entries with no error at all.
+            // Fall back per-direction on that outcome, not just on "no CoE
+            // mailbox at all", so these terminals still get real fields once
+            // ExpandOpaqueFromEsi (main.cpp) has an ESI match to expand from.
+            size_t beforeOut = ds.variables.size();
+            EnumerateDirection(static_cast<uint16_t>(i), 0x1C12, DataDirection::Output, ec_slave[i].outputs,
+                                ds.variables);
+            if (ds.variables.size() == beforeOut) AddOpaqueFallback(ds, DataDirection::Output);
 
-            if (!outOk && !inOk) {
-                spdlog::debug("Slave {} has no CoE mailbox; exposing raw I/O buffers", i);
-                AddOpaqueFallback(ds);
-            }
+            size_t beforeIn = ds.variables.size();
+            EnumerateDirection(static_cast<uint16_t>(i), 0x1C13, DataDirection::Input, ec_slave[i].inputs,
+                                ds.variables);
+            if (ds.variables.size() == beforeIn) AddOpaqueFallback(ds, DataDirection::Input);
 
             slaves_.push_back(std::move(ds));
         }
@@ -179,7 +277,11 @@ public:
 
     std::vector<DiscoveredSlave>& slaves() override { return slaves_; }
 
-    void updateIO() override {
+    // SOEM has no receive/process step that resets output memory, and
+    // send() transmits immediately -- so applying writes right before
+    // send() (same as this class always did) is already correct.
+    void updateIO(const std::function<void()>& applyWrites) override {
+        applyWrites();
         ec_send_processdata();
         ec_receive_processdata(EC_TIMEOUTRET);
     }
@@ -188,6 +290,70 @@ public:
         ec_slave[0].state = EC_STATE_INIT;
         ec_writestate(0);
         ec_close();
+    }
+
+    // Standalone tool operation -- see the base class doc comment. Mirrors
+    // SOEM's own bundled eepromtool/aliastool reference implementation: a
+    // bare slave-count scan (no ec_config_init/ec_config_map), then for each
+    // requested slave, force EEPROM control to the master and write word
+    // address 0x04 (the SII "Configured Station Alias") via auto-increment
+    // addressing.
+    bool writeAliases(const Config& cfg, const std::vector<std::pair<uint16_t, uint16_t>>& ringPosToAlias) override {
+        if (ec_init(cfg.interface.c_str()) <= 0) {
+            spdlog::critical("ec_init failed for interface '{}'", cfg.interface);
+            return false;
+        }
+
+        uint16_t typeReg = 0;
+        int wkc = ec_BRD(0x0000, ECT_REG_TYPE, sizeof(typeReg), &typeReg, EC_TIMEOUTSAFE);
+        if (wkc <= 0) {
+            spdlog::critical("No EtherCAT slaves found on {}", cfg.interface);
+            ec_close();
+            return false;
+        }
+        int slaveCount = wkc;
+        spdlog::info("{} slave(s) found on {}", slaveCount, cfg.interface);
+
+        bool allOk = true;
+        for (auto& [ringPos, alias] : ringPosToAlias) {
+            if (ringPos < 1 || ringPos > slaveCount) {
+                spdlog::error("Ring position {} out of range (1..{})", ringPos, slaveCount);
+                allOk = false;
+                continue;
+            }
+
+            uint16_t aiadr = static_cast<uint16_t>(1 - static_cast<int>(ringPos));
+            uint8_t eepctl = 2;
+            ec_APWR(aiadr, ECT_REG_EEPCFG, sizeof(eepctl), &eepctl, EC_TIMEOUTRET); // force EEPROM from PDI
+            eepctl = 0;
+            ec_APWR(aiadr, ECT_REG_EEPCFG, sizeof(eepctl), &eepctl, EC_TIMEOUTRET); // EEPROM control to master
+
+            // Read the current first 14 bytes, patch in the new alias word,
+            // and recompute the checksum over the patched buffer -- writing
+            // just the alias word and leaving the old checksum in place is
+            // what corrupts the EEPROM (the ESC refuses to load it at the
+            // next reset, i.e. the slave fails to boot).
+            uint8_t buf[14] = {};
+            ReadEeprom(aiadr, buf, 0, sizeof(buf));
+            buf[0x08] = static_cast<uint8_t>(alias & 0xFF);
+            buf[0x09] = static_cast<uint8_t>((alias >> 8) & 0xFF);
+            uint8_t crc = SiiCrc(buf);
+
+            if (ec_writeeepromAP(aiadr, 0x04, alias, EC_TIMEOUTEEP) <= 0 ||
+                ec_writeeepromAP(aiadr, 0x07, crc, EC_TIMEOUTEEP) <= 0) {
+                spdlog::error("Failed to write alias {:#06x} (or its checksum) to slave at ring position {}", alias,
+                              ringPos);
+                allOk = false;
+                continue;
+            }
+            spdlog::info(
+                "Wrote alias {:#06x} to slave at ring position {}. Power-cycle that slave for the new alias "
+                "to take effect -- it's latched by the EtherCAT slave controller at reset, not live.",
+                alias, ringPos);
+        }
+
+        ec_close();
+        return allOk;
     }
 
 private:

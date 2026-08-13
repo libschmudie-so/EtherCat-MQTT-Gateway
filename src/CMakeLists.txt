@@ -23,6 +23,7 @@ add_executable(ethercat-mqtt-gateway
     src/logging.cpp
     src/ethercat_types.cpp
     src/esi_repository.cpp
+    src/pdo_override.cpp
     src/slave_device.cpp
     src/mqtt_client.cpp
 )

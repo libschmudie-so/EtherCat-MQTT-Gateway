@@ -24,6 +24,7 @@
 #include "ecmqtt/ethercat_backend.hpp"
 #include "ecmqtt/logging.hpp"
 #include "ecmqtt/mqtt_client.hpp"
+#include "ecmqtt/pdo_override.hpp"
 #include "ecmqtt/slave_device.hpp"
 
 namespace {
@@ -41,6 +42,129 @@ struct WriteRequest {
 
 std::string MakeTopic(const std::string& root, uint16_t csa, uint16_t index, uint8_t subIndex) {
     return fmt::format("{}/{}/{:04X}/{:02X}", root, csa, index, subIndex);
+}
+
+// Slaves with no CoE mailbox (common on basic Beckhoff I/O terminals, e.g.
+// EL4001) can't be enumerated live by the SOEM backend, which hands back one
+// opaque whole-buffer placeholder per direction instead. Such slaves still
+// have a fixed, non-configurable PDO mapping though -- the one declared in
+// their ESI file -- so when a match is found, replace the placeholder with
+// real per-entry fields by walking the ESI device's PDOs in order and
+// accumulating bit offsets from the placeholder's own base pointer, the same
+// technique used for live CoE PDO-assignment enumeration. If the ESI mapping
+// doesn't fit inside the buffer the backend actually mapped, something's off
+// (revision mismatch, non-default mapping) -- keep the opaque placeholder
+// rather than risk reading past the end of it.
+void ExpandOpaqueFromEsi(ecmqtt::DiscoveredSlave& ds, const ecmqtt::EsiDevice* esiDevice) {
+    if (!esiDevice) return;
+    if (std::none_of(ds.variables.begin(), ds.variables.end(), [](auto& v) { return v.opaque; })) return;
+
+    std::vector<ecmqtt::SlaveVariable> expanded;
+    expanded.reserve(ds.variables.size());
+
+    for (auto& placeholder : ds.variables) {
+        if (!placeholder.opaque) {
+            expanded.push_back(placeholder);
+            continue;
+        }
+
+        uint32_t bitOffsetAccum = 0;
+        std::vector<ecmqtt::SlaveVariable> fields;
+        for (auto& pdo : esiDevice->pdos) {
+            if (pdo.direction != placeholder.direction) continue;
+            for (auto& entry : pdo.entries) {
+                ecmqtt::SlaveVariable v;
+                v.index = entry.index;
+                v.subIndex = entry.subIndex;
+                v.bitLength = entry.bitLen;
+                v.direction = placeholder.direction;
+                v.dataPtr = placeholder.dataPtr + (bitOffsetAccum / 8);
+                v.bitOffset = static_cast<uint8_t>(bitOffsetAccum % 8);
+                v.name = entry.name.empty() ? fmt::format("{:04X}:{:02X}", entry.index, entry.subIndex) : entry.name;
+                v.dataType = entry.dataType != ecmqtt::EthercatDataType::Unknown
+                                  ? entry.dataType
+                                  : ecmqtt::GuessDataTypeFromBitLength(entry.bitLen);
+                bitOffsetAccum += entry.bitLen;
+                fields.push_back(std::move(v));
+            }
+        }
+
+        if (fields.empty() || bitOffsetAccum > placeholder.bitLength) {
+            spdlog::debug("ESI PDO mapping for a slave doesn't fit its {}-bit buffer; keeping raw fallback",
+                          placeholder.bitLength);
+            expanded.push_back(placeholder);
+            continue;
+        }
+
+        for (auto& f : fields) expanded.push_back(std::move(f));
+    }
+
+    ds.variables = std::move(expanded);
+}
+
+// Fills in .rxPdos/.txPdos (index + entries) for each override by matching
+// its (vendorId, productCode, revisionNo) against a loaded ESI device and
+// picking out the requested RxPdo/TxPdo blocks by index. Leaves a PDO's
+// entries empty (backends then fall back to the slave's own default entries
+// for that PDO index, still selecting the right one) when no ESI match is
+// found -- logged, not fatal, since the assignment itself can still be
+// attempted on the wire.
+void ResolvePdoOverrides(std::vector<ecmqtt::PdoOverride>& overrides, ecmqtt::EsiRepository& esiRepo) {
+    auto resolveDirection = [](const ecmqtt::EsiDevice* dev, const std::vector<uint16_t>& indices,
+                                ecmqtt::DataDirection dir, std::vector<ecmqtt::PdoOverridePdo>& out) {
+        for (uint16_t pdoIndex : indices) {
+            ecmqtt::PdoOverridePdo pdo;
+            pdo.pdoIndex = pdoIndex;
+
+            const ecmqtt::EsiPdo* match = nullptr;
+            if (dev) {
+                for (auto& p : dev->pdos)
+                    if (p.index == pdoIndex && p.direction == dir) { match = &p; break; }
+            }
+            if (match) {
+                for (auto& e : match->entries) pdo.entries.push_back({e.index, e.subIndex, e.bitLen});
+            } else if (dev) {
+                spdlog::warn("--pdo-config: PDO {:#06x} not found in ESI for vendor {:#x} product {:#x} rev {:#x}",
+                             pdoIndex, dev->vendorId, dev->productCode, dev->revisionNo);
+            }
+            out.push_back(std::move(pdo));
+        }
+    };
+
+    for (auto& ov : overrides) {
+        const ecmqtt::EsiDevice* dev = esiRepo.resolve(ov.vendorId, ov.productCode, ov.revisionNo);
+        if (!dev)
+            spdlog::warn(
+                "--pdo-config: no ESI match for vendor {:#x} product {:#x} rev {:#x}; the requested PDO "
+                "assignment will still be attempted on the wire, but field names/types won't be resolved",
+                ov.vendorId, ov.productCode, ov.revisionNo);
+
+        resolveDirection(dev, ov.rxPdoIndices, ecmqtt::DataDirection::Output, ov.rxPdos);
+        resolveDirection(dev, ov.txPdoIndices, ecmqtt::DataDirection::Input, ov.txPdos);
+    }
+}
+
+// Parses "<ringPos>=<alias>[,<ringPos>=<alias>...]" for --write-alias.
+// Accepts decimal or 0x-prefixed hex for the alias value.
+std::vector<std::pair<uint16_t, uint16_t>> ParseAliasSpec(const std::string& spec) {
+    std::vector<std::pair<uint16_t, uint16_t>> result;
+    size_t start = 0;
+    while (start < spec.size()) {
+        size_t comma = spec.find(',', start);
+        std::string item = spec.substr(start, comma - start);
+
+        size_t eq = item.find('=');
+        if (eq == std::string::npos)
+            throw std::invalid_argument("--write-alias: expected <ringPos>=<alias>, got '" + item + "'");
+
+        uint16_t ringPos = static_cast<uint16_t>(std::stoul(item.substr(0, eq)));
+        uint16_t alias = static_cast<uint16_t>(std::stoul(item.substr(eq + 1), nullptr, 0));
+        result.emplace_back(ringPos, alias);
+
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    return result;
 }
 
 // Opt-in via --realtime (see Config::realtime). In principle this protects
@@ -81,6 +205,20 @@ int main(int argc, char** argv) {
     ecmqtt::Config cfg = std::move(*parsed);
     ecmqtt::InitLogging(cfg.logLevel);
 
+    // --write-alias switches into a standalone tool mode: write the
+    // requested aliases and exit, never touching MQTT or the cycle loop.
+    if (cfg.writeAlias) {
+        std::vector<std::pair<uint16_t, uint16_t>> pairs;
+        try {
+            pairs = ParseAliasSpec(*cfg.writeAlias);
+        } catch (const std::exception& ex) {
+            spdlog::critical("{}", ex.what());
+            return 2;
+        }
+        auto backend = ecmqtt::createBackend();
+        return backend->writeAliases(cfg, pairs) ? 0 : 1;
+    }
+
     spdlog::info(
         "Starting ethercat-mqtt-gateway: iface={} broker={}:{} esi={} freq={}Hz retain={} topic={} clientId={} "
         "useReportedCsa={}",
@@ -100,10 +238,35 @@ int main(int argc, char** argv) {
         const char* home = std::getenv("HOME");
         return std::string(home ? home : ".") + "/.local/share/ESI";
     }());
-    std::string esiCachePath = [] {
+    std::string esiIndexPath = [] {
         const char* home = std::getenv("HOME");
-        return std::string(home ? home : ".") + "/.cache/ecmqtt/esi_cache.json";
+        return std::string(home ? home : ".") + "/.cache/ecmqtt/esi_index.json";
     }();
+
+    // The index (path -> content hash -> device identities it declares)
+    // lets refreshIndex() skip re-parsing any ESI file that hasn't changed
+    // since last run, without duplicating that file's actual content into
+    // the cache -- resolve() parses the one owning file on demand, the
+    // first time a given device is actually needed.
+    ecmqtt::EsiRepository esiRepo;
+    esiRepo.loadIndex(esiIndexPath);
+    esiRepo.refreshIndex(esiDir);
+    esiRepo.saveIndex(esiIndexPath);
+
+    if (cfg.pdoConfigPath) {
+        try {
+            cfg.pdoOverrides = ecmqtt::LoadPdoOverrideConfig(*cfg.pdoConfigPath);
+        } catch (const std::exception& ex) {
+            spdlog::critical("Failed to load --pdo-config '{}': {}", *cfg.pdoConfigPath, ex.what());
+            return 1;
+        }
+
+        // Both backends need each override's PDO entries resolved from ESI
+        // *before* configure() returns -- SOEM applies the assignment during
+        // its PRE-OP transition hook, IGH hands entries straight to
+        // ecrt_slave_config_pdos().
+        ResolvePdoOverrides(cfg.pdoOverrides, esiRepo);
+    }
 
     auto backend = ecmqtt::createBackend();
     try {
@@ -114,50 +277,42 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Devices already seen on a previous run are cached (see saveCacheFile
-    // below), so a slave we already resolved needs no ESI directory access
-    // at all -- only slaves still unknown after the cache is loaded get
-    // added to the filter, and loadDirectory() is skipped entirely if that
-    // leaves nothing to look up.
-    ecmqtt::EsiRepository esiRepo;
-    esiRepo.loadCacheFile(esiCachePath);
-
-    ecmqtt::EsiFilter esiFilter;
-    for (auto& ds : backend->slaves()) {
-        if (esiRepo.find(ds.vendorId, ds.productCode, ds.revisionNo)) continue; // already known
-        esiFilter.vendorIds.insert(ds.vendorId);
-        esiFilter.deviceKeys.insert(ecmqtt::EsiFilter::MakeDeviceKey(ds.productCode, ds.revisionNo));
-    }
-
-    if (!esiFilter.deviceKeys.empty())
-        esiRepo.loadDirectory(esiDir, &esiFilter);
-
-    esiRepo.saveCacheFile(esiCachePath);
-
-    // Resolve slave-level name/description via ESI, and cross-reference each
-    // live PDO entry's name/dataType by (index, subIndex) when a match exists.
-    std::vector<ecmqtt::SlaveDevice> devices;
-    devices.reserve(backend->slaves().size());
-    for (auto& ds : backend->slaves()) {
-        const ecmqtt::EsiDevice* esiDevice = esiRepo.find(ds.vendorId, ds.productCode, ds.revisionNo);
-        std::string name = esiDevice && !esiDevice->name.empty() ? esiDevice->name : ds.liveName;
-        std::string description = esiDevice && !esiDevice->description.empty() ? esiDevice->description : name;
-
-        for (auto& v : ds.variables) {
-            const ecmqtt::EsiPdoEntry* entry = esiDevice ? esiDevice->findEntry(v.index, v.subIndex) : nullptr;
-            if (entry) {
-                if (!entry->name.empty()) v.name = entry->name;
-                if (entry->dataType != ecmqtt::EthercatDataType::Unknown) v.dataType = entry->dataType;
-            } else if (v.name.empty()) {
-                v.name = fmt::format("{:04X}:{:02X}", v.index, v.subIndex);
-            }
-        }
-
-        devices.emplace_back(ds, std::move(name), std::move(description));
-    }
-    spdlog::info("Discovered {} slave(s)", devices.size());
-
     std::mutex ecMutex;
+
+    // Resolves slave-level name/description via ESI, cross-references each
+    // live PDO entry's name/dataType by (index, subIndex) when a match
+    // exists, and wraps everything as SlaveDevice. Used for the initial
+    // discovery below and again after a hotplug reconfigure() picks up a
+    // new bus topology -- callers must hold ecMutex before replacing
+    // `devices` with this function's result, since the MQTT thread reads it
+    // concurrently (see setOnMessage/publishMetadataAndSubscribe below).
+    auto buildDevices = [&]() {
+        std::vector<ecmqtt::SlaveDevice> result;
+        result.reserve(backend->slaves().size());
+        for (auto& ds : backend->slaves()) {
+            const ecmqtt::EsiDevice* esiDevice = esiRepo.resolve(ds.vendorId, ds.productCode, ds.revisionNo);
+            std::string name = esiDevice && !esiDevice->name.empty() ? esiDevice->name : ds.liveName;
+            std::string description = esiDevice && !esiDevice->description.empty() ? esiDevice->description : name;
+
+            ExpandOpaqueFromEsi(ds, esiDevice);
+
+            for (auto& v : ds.variables) {
+                const ecmqtt::EsiPdoEntry* entry = esiDevice ? esiDevice->findEntry(v.index, v.subIndex) : nullptr;
+                if (entry) {
+                    if (!entry->name.empty()) v.name = entry->name;
+                    if (entry->dataType != ecmqtt::EthercatDataType::Unknown) v.dataType = entry->dataType;
+                } else if (v.name.empty()) {
+                    v.name = fmt::format("{:04X}:{:02X}", v.index, v.subIndex);
+                }
+            }
+
+            result.emplace_back(ds, std::move(name), std::move(description));
+        }
+        return result;
+    };
+
+    std::vector<ecmqtt::SlaveDevice> devices = buildDevices();
+    spdlog::info("Discovered {} slave(s)", devices.size());
     std::mutex cacheMutex;
     std::unordered_map<std::string, std::string> cache;
     std::mutex writeMutex;
@@ -205,15 +360,24 @@ int main(int argc, char** argv) {
             if (it != cache.end() && it->second == strVal) return;
         }
 
-        auto devIt = std::find_if(devices.begin(), devices.end(),
-                                   [&](ecmqtt::SlaveDevice& d) { return d.GetCsa(cfg.useReportedCsa) == csa; });
-        if (devIt == devices.end()) return;
-
-        auto outVars = devIt->GetOutputVariables();
-        auto varIt = std::find_if(outVars.begin(), outVars.end(), [&](ecmqtt::SlaveVariable* v) {
-            return v->index == index && v->subIndex == sub;
-        });
-        if (varIt == outVars.end()) return;
+        // devices can be replaced wholesale by a hotplug reconfigure on the
+        // main cycle thread (see buildDevices() above); guard access with
+        // the same mutex that protects it there.
+        bool found;
+        {
+            std::lock_guard<std::mutex> lock(ecMutex);
+            auto devIt = std::find_if(devices.begin(), devices.end(),
+                                       [&](ecmqtt::SlaveDevice& d) { return d.GetCsa(cfg.useReportedCsa) == csa; });
+            found = devIt != devices.end();
+            if (found) {
+                auto outVars = devIt->GetOutputVariables();
+                auto varIt = std::find_if(outVars.begin(), outVars.end(), [&](ecmqtt::SlaveVariable* v) {
+                    return v->index == index && v->subIndex == sub;
+                });
+                found = varIt != outVars.end();
+            }
+        }
+        if (!found) return;
 
         {
             std::lock_guard<std::mutex> lock(cacheMutex);
@@ -225,21 +389,37 @@ int main(int argc, char** argv) {
         }
     });
 
-    mqtt.setOnConnect([&]() {
-        spdlog::info("MQTT (re)connected; publishing metadata and subscribing to outputs");
+    // Publishes retained metadata + subscribes to output topics for every
+    // current slave, and republishes bridge/info. Called on every MQTT
+    // (re)connect, and again after a hotplug reconfigure picks up a new
+    // topology. Only takes ecMutex long enough to snapshot what's needed
+    // from `devices` -- the actual publish/subscribe calls (network I/O)
+    // run unlocked, same reasoning as decoupling MQTT from the EtherCAT
+    // cycle thread elsewhere: a slow broker must never hold up updateIO().
+    auto publishMetadataAndSubscribe = [&]() {
+        struct Entry {
+            uint16_t csa;
+            nlohmann::json meta;
+        };
+        std::vector<Entry> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(ecMutex);
+            snapshot.reserve(devices.size());
+            for (auto& dev : devices) snapshot.push_back({dev.GetCsa(cfg.useReportedCsa), dev.GetMetadata()});
+        }
+
+        spdlog::info("Publishing metadata and subscribing to outputs for {} slave(s)", snapshot.size());
         mqtt.publish(statusTopic, "online", 1, true);
 
         nlohmann::json slaveSummary = nlohmann::json::object();
-        for (auto& dev : devices) {
-            auto meta = dev.GetMetadata();
-
-            std::string metaTopic = fmt::format("{}/{}/metadata", cfg.topic, dev.GetCsa(cfg.useReportedCsa));
+        for (auto& [csa, meta] : snapshot) {
+            std::string metaTopic = fmt::format("{}/{}/metadata", cfg.topic, csa);
             mqtt.publish(metaTopic, meta.dump(), 1, true);
 
-            std::string outFilter = fmt::format("{}/{}/+/+", cfg.topic, dev.GetCsa(cfg.useReportedCsa));
+            std::string outFilter = fmt::format("{}/{}/+/+", cfg.topic, csa);
             mqtt.subscribe(outFilter, 1);
 
-            slaveSummary[std::to_string(dev.GetCsa())] = {
+            slaveSummary[std::to_string(meta["ringCsa"].get<uint16_t>())] = {
                 {"name", meta["name"]},
                 {"description", meta["description"]},
                 {"reportedCsa", meta["reportedCsa"]},
@@ -255,6 +435,11 @@ int main(int argc, char** argv) {
             {"slaves", slaveSummary},
         };
         mqtt.publish(cfg.topic + "/bridge/info", info.dump(), 1, true);
+    };
+
+    mqtt.setOnConnect([&]() {
+        spdlog::info("MQTT (re)connected");
+        publishMetadataAndSubscribe();
     });
 
     spdlog::info("Connecting to MQTT broker at {}:{}...", cfg.broker, cfg.port);
@@ -331,7 +516,12 @@ int main(int argc, char** argv) {
 
     spdlog::info("Press Ctrl+C to exit.");
 
+    if (cfg.hotplug && !backend->supportsHotplug())
+        spdlog::warn("--hotplug was requested but this backend doesn't support it; ignoring");
+
+    int exitCode = 0;
     uint64_t overruns = 0;
+    auto lastHotplugCheck = std::chrono::steady_clock::now();
     // First tick fires immediately (not after a full period) so the first
     // updateIO() call lands as soon as possible after activate().
     auto nextTick = std::chrono::steady_clock::now();
@@ -344,7 +534,12 @@ int main(int argc, char** argv) {
         snapshot.reserve(256);
         {
             std::lock_guard<std::mutex> lock(ecMutex);
-            {
+
+            // Passed to the backend so it can apply pending writes at
+            // exactly the right point in its own cyclic exchange -- see
+            // IEtherCatBackend::updateIO() -- rather than main.cpp guessing
+            // an ordering that only happens to work for one backend.
+            backend->updateIO([&] {
                 std::deque<WriteRequest> local;
                 {
                     std::lock_guard<std::mutex> wlock(writeMutex);
@@ -369,9 +564,7 @@ int main(int argc, char** argv) {
                                      req.subIndex, req.value.dump(), ex.what());
                     }
                 }
-            }
-
-            backend->updateIO();
+            });
 
             for (auto& dev : devices) {
                 auto vars = cfg.noPublishOutputs ? dev.GetInputVariables() : dev.GetAllVariables();
@@ -396,6 +589,37 @@ int main(int argc, char** argv) {
                          std::chrono::duration<double, std::milli>(elapsed).count(),
                          std::chrono::duration<double, std::milli>(period).count(), overruns);
         }
+
+        if (cfg.hotplug && backend->supportsHotplug()) {
+            auto hpNow = std::chrono::steady_clock::now();
+            if (hpNow - lastHotplugCheck >= std::chrono::seconds(2)) {
+                lastHotplugCheck = hpNow;
+                if (backend->topologyChanged()) {
+                    spdlog::info(
+                        "EtherCAT topology change detected; reconfiguring (all slaves briefly pause)...");
+                    try {
+                        backend->reconfigure(cfg);
+                    } catch (const std::exception& ex) {
+                        spdlog::critical("Failed to reconfigure EtherCAT master after a topology change: {}",
+                                          ex.what());
+                        exitCode = 1;
+                        break;
+                    }
+
+                    auto newDevices = buildDevices();
+                    {
+                        std::lock_guard<std::mutex> lock(ecMutex);
+                        devices = std::move(newDevices);
+                    }
+                    spdlog::info("Reconfigured: {} slave(s) now known", devices.size());
+                    publishMetadataAndSubscribe();
+
+                    // reconfigure() took nontrivial wall-clock time; resume
+                    // from now rather than firing a burst of "missed" ticks.
+                    nextTick = std::chrono::steady_clock::now();
+                }
+            }
+        }
     }
 
     spdlog::info("Shutting down...");
@@ -410,5 +634,5 @@ int main(int argc, char** argv) {
     mqtt.disconnect();
     backend->shutdown();
     spdlog::info("Shutdown complete.");
-    return 0;
+    return exitCode;
 }

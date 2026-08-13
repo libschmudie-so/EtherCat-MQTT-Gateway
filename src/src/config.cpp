@@ -46,6 +46,19 @@ std::optional<Config> ParseArgs(int argc, char** argv) {
         ("realtime", "Request SCHED_FIFO + mlockall for the cycle thread. Validate on your target first: "
                      "on some systems this can starve the kernel's own EtherCAT master thread instead of helping.",
          cxxopts::value<bool>()->default_value("false"))
+        ("pdo-config", "Path to a JSON file selecting a non-default PDO assignment for specific slaves "
+                       "(matched by vendor/product/revision), picking an alternate RxPdo/TxPdo declared in "
+                       "their ESI file instead of whatever's currently active.", cxxopts::value<std::string>())
+        ("write-alias", "Write a persistent SII station alias to one or more slaves addressed by their "
+                        "current ring position, then exit -- does not run the bridge. Format: "
+                        "<ringPos>=<alias>[,<ringPos>=<alias>...]. SOEM only: IGH's userspace library has no "
+                        "SII/EEPROM write API, use the target's own 'ethercat alias' tool instead. Requires "
+                        "power-cycling the slave(s) for the new alias to take effect.",
+         cxxopts::value<std::string>())
+        ("hotplug", "IGH only: periodically check for hot-plugged/removed slaves and reconfigure to pick them "
+                    "up. Briefly pauses cyclic servicing for every slave (not just the one that changed) each "
+                    "time it reconfigures -- see --help output or README for details.",
+         cxxopts::value<bool>()->default_value("false"))
         ("h,help", "Print usage.");
     // clang-format on
 
@@ -78,6 +91,9 @@ std::optional<Config> ParseArgs(int argc, char** argv) {
     cfg.clientId = result["client-id"].as<std::string>();
     cfg.useReportedCsa = result["use-reported-csa"].as<bool>();
     cfg.realtime = result["realtime"].as<bool>();
+    if (result.count("pdo-config")) cfg.pdoConfigPath = result["pdo-config"].as<std::string>();
+    if (result.count("write-alias")) cfg.writeAlias = result["write-alias"].as<std::string>();
+    cfg.hotplug = result["hotplug"].as<bool>();
 
     if (cfg.port <= 0 || cfg.port > 65535)
         throw std::invalid_argument("Invalid --port");

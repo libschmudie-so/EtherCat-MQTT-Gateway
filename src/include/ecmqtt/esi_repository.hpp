@@ -1,10 +1,8 @@
 #pragma once
 
 #include <cstdint>
-#include <optional>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "ecmqtt/ethercat_types.hpp"
@@ -38,52 +36,47 @@ struct EsiDevice {
     const EsiPdoEntry* findEntry(uint16_t index, uint8_t subIndex) const;
 };
 
-// Restricts loadDirectory() to only the vendors/devices actually present on
-// the bus. Real-world ESI directories (e.g. a full vendor's official XML
-// dump) can hold many megabytes and thousands of unrelated device
-// descriptions across many files; without filtering, loadDirectory() parses
-// all of it up front regardless of what's connected. Both sets should come
-// from the same discovered-slave list; an empty filter (default-constructed,
-// or passed as nullptr to loadDirectory) means "load everything".
-struct EsiFilter {
-    std::unordered_set<uint32_t> vendorIds;
-    std::unordered_set<uint64_t> deviceKeys; // MakeDeviceKey(productCode, revisionNo)
-
-    static uint64_t MakeDeviceKey(uint32_t productCode, uint32_t revisionNo) {
-        return (static_cast<uint64_t>(productCode) << 32) | revisionNo;
-    }
-};
-
-// Loads and indexes every ESI *.xml file in a directory, keyed by
-// (VendorId, ProductCode, RevisionNo).
+// Indexes ESI *.xml files by which device (VendorId, ProductCode,
+// RevisionNo) each one describes, without duplicating their content: the
+// persisted index (see loadIndex()/saveIndex()) only stores, per file, a
+// change-detection hash and the list of devices it declares. Full device
+// detail (name, PDOs) is parsed from the actual file on demand, one file at
+// a time, the first time it's actually needed -- see resolve(). This trades
+// a small per-run parse cost (one targeted file per distinct device
+// actually in use, not the whole ESI directory) for never going stale
+// relative to the ESI files themselves and for a much smaller cache file.
 class EsiRepository {
 public:
-    // Loads all *.xml files directly inside dir. Parse errors on individual
-    // files are logged and skipped rather than aborting the whole load. If
-    // filter is non-null and non-empty, devices not present in it are
-    // skipped while walking each file's DOM tree (their name/PDO details
-    // are never extracted) -- pass nullptr to load every device found.
-    void loadDirectory(const std::string& dir, const EsiFilter* filter = nullptr);
+    // Loads a previously-saved index (see saveIndex()); silently does
+    // nothing if the file doesn't exist yet.
+    void loadIndex(const std::string& path);
 
-    // Loads devices previously written by saveCacheFile(), if the file
-    // exists (silently does nothing otherwise). Call this before
-    // loadDirectory() so already-known devices don't need to be re-parsed.
-    void loadCacheFile(const std::string& path);
+    // Rescans dir for *.xml files, keeping the index in sync: a file whose
+    // content hash still matches what's already recorded is trusted as-is
+    // (not re-parsed at all); a new or changed file gets a lightweight scan
+    // (device identity only -- no name/PDO detail, that's resolved lazily
+    // by resolve()) to (re)populate its entry. Entries for files no longer
+    // present under dir are dropped. Call this once at startup, before any
+    // resolve() calls.
+    void refreshIndex(const std::string& dir);
 
-    // Writes every currently-known device to path as JSON, so a future run
-    // with the same hardware can skip re-parsing the ESI directory for them
-    // entirely via loadCacheFile(). Creates parent directories as needed.
-    void saveCacheFile(const std::string& path) const;
+    // Writes the current index to path. Creates parent directories as
+    // needed.
+    void saveIndex(const std::string& path) const;
 
-    const EsiDevice* find(uint32_t vendorId, uint32_t productCode, uint32_t revisionNo) const;
+    // Resolves (vendorId, productCode, revisionNo) to full device detail.
+    // Returns from an in-memory cache if already resolved earlier this run;
+    // otherwise looks up which file the index says declares it and parses
+    // just that one file, on demand. Returns nullptr if the device isn't in
+    // the index at all (refreshIndex() wasn't pointed at the right
+    // directory, or no ESI file declares it).
+    const EsiDevice* resolve(uint32_t vendorId, uint32_t productCode, uint32_t revisionNo);
 
-    size_t deviceCount() const { return devices_.size(); }
+    // Total distinct devices known to the index, whether or not their full
+    // detail has been resolved into memory yet this run.
+    size_t indexedDeviceCount() const { return deviceFile_.size(); }
 
 private:
-    // Returns true if the file was actually DOM-parsed, false if it failed
-    // to load/parse.
-    bool loadFile(const std::string& path, const EsiFilter* filter);
-
     struct Key {
         uint32_t vendorId, productCode, revisionNo;
         bool operator==(const Key& o) const {
@@ -98,8 +91,21 @@ private:
             return h;
         }
     };
+    struct IndexedFile {
+        std::string hash;
+        std::vector<Key> deviceKeys;
+    };
 
-    std::unordered_map<Key, EsiDevice, KeyHash> devices_;
+    // Lightweight scan: just the device identities declared in a file, no
+    // name/PDO detail -- used to (re)build the index cheaply.
+    static std::vector<Key> ExtractDeviceKeys(const std::string& path);
+    // Full targeted parse: extracts name/description/PDOs for exactly one
+    // device out of a (possibly much larger, multi-device) ESI file.
+    static bool ParseDeviceFromFile(const std::string& path, const Key& target, EsiDevice& out);
+
+    std::unordered_map<std::string, IndexedFile> fileIndex_;   // file path -> hash + devices it declares
+    std::unordered_map<Key, std::string, KeyHash> deviceFile_; // device -> owning file path (derived from fileIndex_)
+    std::unordered_map<Key, EsiDevice, KeyHash> devices_;      // resolved so far this run
 };
 
 // Parses an ESI-style number: "#x1234" (hex), "0x1234" (hex), or a plain
