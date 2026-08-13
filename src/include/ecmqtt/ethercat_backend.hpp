@@ -11,6 +11,7 @@
 #include <spdlog/spdlog.h>
 
 #include "ecmqtt/config.hpp"
+#include "ecmqtt/esi_repository.hpp"
 #include "ecmqtt/ethercat_types.hpp"
 
 namespace ecmqtt {
@@ -18,6 +19,7 @@ namespace ecmqtt {
 // A single PDO entry mapped into the live process image.
 struct SlaveVariable {
     std::string name;              // resolved from ESI, or a numeric fallback
+    std::string description;       // resolved from ESI (falls back to name); empty without a match
     uint16_t index = 0;
     uint8_t subIndex = 0;
     uint16_t bitLength = 0;
@@ -58,7 +60,16 @@ public:
     // SAFE-OP as needed to read CoE PDO assignment) -- but does not yet
     // demand cyclic servicing from the caller. Throws std::runtime_error on
     // failure. slaves() is valid after this returns.
-    virtual void configure(const Config& cfg) = 0;
+    //
+    // esiRepo is passed in (already pointed at the configured ESI directory
+    // by main.cpp) so a backend can fall back to a device's ESI-declared
+    // default PDO mapping when its own live introspection can't enumerate
+    // one -- see IghBackend::rescan() for the case that needs this (a
+    // hardwired-mapping slave with neither a CoE mailbox nor an SII PDO-
+    // assignment category). Backends that don't need it (SOEM: its
+    // opaque-placeholder fallback is resolved against ESI entirely in
+    // main.cpp, after configure() returns) may just ignore it.
+    virtual void configure(const Config& cfg, EsiRepository& esiRepo) = 0;
 
     // Finalizes configuration and brings all slaves toward OPERATIONAL,
     // starting the point at which the master expects the caller to call
@@ -119,8 +130,9 @@ public:
     // failure, same as configure()/activate() -- the caller should treat
     // that as fatal, since the old topology is already gone by the time
     // this can fail.
-    virtual void reconfigure(const Config& cfg) {
+    virtual void reconfigure(const Config& cfg, EsiRepository& esiRepo) {
         (void)cfg;
+        (void)esiRepo;
         throw std::logic_error("reconfigure() not supported by this backend");
     }
 

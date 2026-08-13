@@ -14,6 +14,10 @@ struct EsiPdoEntry {
     uint8_t subIndex = 0;
     uint16_t bitLen = 0;
     std::string name;
+    // From the entry's own <Comment>, if present; falls back to name (same
+    // pattern as EsiDevice::description) so consumers always get something
+    // readable rather than having to fall back themselves.
+    std::string description;
     std::string dataTypeStr;
     EthercatDataType dataType = EthercatDataType::Unknown;
 };

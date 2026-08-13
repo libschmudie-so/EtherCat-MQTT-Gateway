@@ -190,7 +190,11 @@ void AddOpaqueFallback(DiscoveredSlave& ds, DataDirection dir) {
 
 class SoemBackend final : public IEtherCatBackend {
 public:
-    void configure(const Config& cfg) override {
+    // esiRepo is unused here: SOEM's opaque-placeholder fallback for
+    // CoE-less slaves (AddOpaqueFallback below) is expanded against ESI
+    // entirely in main.cpp's ExpandOpaqueFromEsi, after this returns.
+    void configure(const Config& cfg, EsiRepository& esiRepo) override {
+        (void)esiRepo;
         if (ec_init(cfg.interface.c_str()) <= 0)
             throw std::runtime_error("ec_init failed for interface '" + cfg.interface +
                                       "' (check the name and NET_RAW/NET_ADMIN permissions)");

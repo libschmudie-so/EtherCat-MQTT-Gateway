@@ -81,6 +81,7 @@ void ExpandOpaqueFromEsi(ecmqtt::DiscoveredSlave& ds, const ecmqtt::EsiDevice* e
                 v.dataPtr = placeholder.dataPtr + (bitOffsetAccum / 8);
                 v.bitOffset = static_cast<uint8_t>(bitOffsetAccum % 8);
                 v.name = entry.name.empty() ? fmt::format("{:04X}:{:02X}", entry.index, entry.subIndex) : entry.name;
+                v.description = entry.description;
                 v.dataType = entry.dataType != ecmqtt::EthercatDataType::Unknown
                                   ? entry.dataType
                                   : ecmqtt::GuessDataTypeFromBitLength(entry.bitLen);
@@ -271,7 +272,7 @@ int main(int argc, char** argv) {
     auto backend = ecmqtt::createBackend();
     try {
         spdlog::info("Configuring EtherCAT master (this may take a few seconds)...");
-        backend->configure(cfg);
+        backend->configure(cfg, esiRepo);
     } catch (const std::exception& ex) {
         spdlog::critical("Failed to configure EtherCAT master: {}", ex.what());
         return 1;
@@ -300,6 +301,7 @@ int main(int argc, char** argv) {
                 const ecmqtt::EsiPdoEntry* entry = esiDevice ? esiDevice->findEntry(v.index, v.subIndex) : nullptr;
                 if (entry) {
                     if (!entry->name.empty()) v.name = entry->name;
+                    if (!entry->description.empty()) v.description = entry->description;
                     if (entry->dataType != ecmqtt::EthercatDataType::Unknown) v.dataType = entry->dataType;
                 } else if (v.name.empty()) {
                     v.name = fmt::format("{:04X}:{:02X}", v.index, v.subIndex);
@@ -598,7 +600,7 @@ int main(int argc, char** argv) {
                     spdlog::info(
                         "EtherCAT topology change detected; reconfiguring (all slaves briefly pause)...");
                     try {
-                        backend->reconfigure(cfg);
+                        backend->reconfigure(cfg, esiRepo);
                     } catch (const std::exception& ex) {
                         spdlog::critical("Failed to reconfigure EtherCAT master after a topology change: {}",
                                           ex.what());

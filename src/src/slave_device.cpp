@@ -105,6 +105,7 @@ nlohmann::json SlaveDevice::GetMetadata() const {
 
         pdos.push_back({
             {"name", v.name},
+            {"description", v.description},
             {"bitLength", v.bitLength},
             {"dataType", ToString(v.dataType)},
             {"dataDirection", ToString(v.direction)},

@@ -174,7 +174,7 @@ Some terminals declare more than one PDO set in their ESI file (e.g. "Standard"/
 
 ### Setting a persistent slave alias (`--write-alias`)
 
-**SOEM builds only** -- IGH's userspace library has no SII/EEPROM write API; on IGH targets use the target's own `ethercat alias -pPOSITION VALUE` tool instead (part of the standard IGH master install), then power-cycle the slave.
+**Only built into SOEM builds** -- IGH's userspace library has no SII/EEPROM write API, so `-DEC_BACKEND=IGH` binaries don't have this option at all; on IGH targets use the target's own `ethercat alias -pPOSITION VALUE` tool instead (part of the standard IGH master install), then power-cycle the slave.
 
 ```sh
 ./ethercat-mqtt-gateway --iface eth0 --write-alias "3=100"
@@ -182,11 +182,11 @@ Some terminals declare more than one PDO set in their ESI file (e.g. "Standard"/
 
 Writes alias `100` to the slave currently at ring position 3, then exits without running the bridge. **Power-cycle that slave** afterward -- the alias is latched by the EtherCAT slave controller at reset, not applied live. Once set, `--use-reported-csa` will address it by that alias regardless of where it sits in the ring -- handy for replacing a broken card: write the same alias to its replacement and the MQTT topic doesn't change. Multiple slaves can be set in one call: `--write-alias "1=100,2=101"`.
 
-### Hot-plug / hot-unplug (`--hotplug`, IGH only)
+### Hot-plug / hot-unplug (`--hotplug`, only built into IGH builds)
 
-`--hotplug` periodically checks whether the slaves physically present on the bus differ from what's currently configured, and reconfigures to pick up the change -- newly plugged cards get brought up and start publishing to MQTT, removed cards drop out of the active slave list (their retained MQTT topics are left as-is, not cleared).
+`--hotplug` periodically checks whether the slaves physically present on the bus differ from what's currently configured, and reconfigures to pick up the change -- newly plugged cards get brought up and start publishing to MQTT, removed cards drop out of the active slave list (their retained MQTT topics are left as-is, not cleared). SOEM's classic API has no equivalent notion once `configure()` has run, so `-DEC_BACKEND=SOEM` binaries don't have this option at all.
 
-This has a real cost: IGH's own API is explicit that slave configuration can't be altered once the master is activated, so applying a change means briefly deactivating and reactivating the whole master -- **every** slave (not just the one that changed) drops cyclic servicing for the duration of the reconfigure, not just the hot-plugged one. Each reconfigure also leaks one internal domain object (IGH's public API has no call to free one); fine for occasional hot-plug events, worth knowing if they happen very frequently in your setup. Ignored with a warning on backends that don't support it (SOEM).
+This has a real cost: IGH's own API is explicit that slave configuration can't be altered once the master is activated, so applying a change means briefly deactivating and reactivating the whole master -- **every** slave (not just the one that changed) drops cyclic servicing for the duration of the reconfigure, not just the hot-plugged one. Each reconfigure also leaks one internal domain object (IGH's public API has no call to free one); fine for occasional hot-plug events, worth knowing if they happen very frequently in your setup.
 
 ---
 
@@ -201,5 +201,6 @@ This has a real cost: IGH's own API is explicit that slave configuration can't b
 
 ## Notes
 
-* ESI XML files must be present in the configured ESI directory for slaves/PDOs to get human-readable names; without a match, entries fall back to numeric `Index:SubIndex` names.
+* ESI XML files must be present in the configured ESI directory for slaves/PDOs to get human-readable names and descriptions (`description` in `<topic>/<CSA>/metadata`, from each device's/entry's `<Comment>`, falling back to its name); without a match, entries fall back to numeric `Index:SubIndex` names and an empty description. This applies equally to both backends.
+* On IGH, a slave whose live PDO introspection comes back empty for a sync manager (typically a hardwired-mapping terminal with neither a CoE mailbox nor an SII PDO-assignment category) falls back to that device's ESI-declared default mapping for the direction, the same source SOEM's analogous opaque-buffer fallback uses -- requires the device's ESI file to be present in `--esi`.
 * The container requires `CAP_NET_RAW` and `CAP_NET_ADMIN` to access EtherCAT interfaces **if pipework/macvlan is not used** (e.g. with host networking). This applies to the SOEM backend; the IGH backend instead requires its kernel module to be loaded on the host.

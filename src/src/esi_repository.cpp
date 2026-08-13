@@ -92,6 +92,9 @@ void ParsePdoBlock(tinyxml2::XMLElement* deviceEl, const char* tag, DataDirectio
                 if (const char* txt = e->GetText()) entry.bitLen = static_cast<uint16_t>(ParseEsiNumber(txt));
             if (auto* e = entryEl->FirstChildElement("Name"))
                 if (const char* txt = e->GetText()) entry.name = txt;
+            if (auto* e = entryEl->FirstChildElement("Comment"))
+                if (const char* txt = e->GetText()) entry.description = txt;
+            if (entry.description.empty()) entry.description = entry.name;
             if (auto* e = entryEl->FirstChildElement("DataType")) {
                 if (const char* txt = e->GetText()) {
                     entry.dataTypeStr = txt;

@@ -20,6 +20,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "ecmqtt/esi_repository.hpp"
 #include "ecmqtt/ethercat_backend.hpp"
 #include "ecmqtt/pdo_override.hpp"
 
@@ -39,7 +40,7 @@ public:
         if (master_) ecrt_release_master(master_);
     }
 
-    void configure(const Config& cfg) override {
+    void configure(const Config& cfg, EsiRepository& esiRepo) override {
         // cfg.interface is unused: IGH addresses slaves via its own
         // preconfigured master/device, not an --iface name. cfg.pdoOverrides
         // is used below.
@@ -51,7 +52,7 @@ public:
         domain_ = ecrt_master_create_domain(master_);
         if (!domain_) throw std::runtime_error("ecrt_master_create_domain failed");
 
-        rescan(cfg);
+        rescan(cfg, esiRepo);
     }
 
     // ecrt_master_activate() is what starts the master expecting cyclic
@@ -62,7 +63,14 @@ public:
         if (ecrt_master_activate(master_) != 0) throw std::runtime_error("ecrt_master_activate failed");
 
         uint8_t* domainBase = ecrt_domain_data(domain_);
-        if (!domainBase) throw std::runtime_error("ecrt_domain_data returned null after activation");
+        // ecrt_domain_data() legitimately returns NULL for a zero-size
+        // domain (no PDO entries registered at all -- e.g. every slave was
+        // unplugged, or the ones present expose no process data), not just
+        // on a real failure. Only treat it as fatal when we actually have
+        // offsets waiting to be resolved against it; otherwise pending_ is
+        // empty and the loop below is a no-op anyway.
+        if (!domainBase && !pending_.empty())
+            throw std::runtime_error("ecrt_domain_data returned null after activation");
 
         for (const auto& p : pending_)
             slaves_[p.slaveArrIdx].variables[p.varIdx].dataPtr = domainBase + p.byteOffset;
@@ -118,7 +126,7 @@ public:
 
     // See the base class doc comment for the deactivate/rescan/reactivate
     // cost this incurs -- unavoidable given IGH's documented API contract.
-    void reconfigure(const Config& cfg) override {
+    void reconfigure(const Config& cfg, EsiRepository& esiRepo) override {
         spdlog::info("IGH: topology change detected, reconfiguring ({} slave(s) currently)...", slaves_.size());
 
         if (ecrt_master_deactivate(master_) != 0) throw std::runtime_error("ecrt_master_deactivate failed");
@@ -132,16 +140,72 @@ public:
         domain_ = ecrt_master_create_domain(master_);
         if (!domain_) throw std::runtime_error("ecrt_master_create_domain failed");
 
-        rescan(cfg);
+        rescan(cfg, esiRepo);
         activate();
     }
 
 private:
+    // Builds sync/pdo/entry arrays from pdoList and hands them straight to
+    // ecrt_slave_config_pdos(), which both configures the SM's CoE
+    // assignment for us and makes exactly these entries available for
+    // registration -- then registers each one against domain_ and appends a
+    // SlaveVariable + pending_ offset to ds for every entry that lands.
+    // Shared by the two callers that need to configure a PDO list IGH's own
+    // live introspection wouldn't otherwise give us: an explicit
+    // --pdo-config override, and the ESI-default fallback below for slaves
+    // whose sync manager has no live PDOs to introspect at all. `label` is
+    // just for the warning/log messages so the two cases stay distinguishable.
+    void applyPdoList(ec_slave_config_t* sc, uint8_t syncIdx, ec_direction_t syncDir, DataDirection dir,
+                       unsigned int pos, const std::vector<PdoOverridePdo>& pdoList, DiscoveredSlave& ds,
+                       const char* label) {
+        std::vector<std::vector<ec_pdo_entry_info_t>> entryStorage(pdoList.size());
+        std::vector<ec_pdo_info_t> pdoInfos(pdoList.size());
+        for (size_t i = 0; i < pdoList.size(); ++i) {
+            for (auto& e : pdoList[i].entries)
+                entryStorage[i].push_back({e.index, e.subIndex, static_cast<uint8_t>(e.bitLen)});
+            pdoInfos[i] = {pdoList[i].pdoIndex, static_cast<unsigned int>(entryStorage[i].size()),
+                           entryStorage[i].empty() ? nullptr : entryStorage[i].data()};
+        }
+        ec_sync_info_t syncCfg{syncIdx, syncDir, static_cast<unsigned int>(pdoInfos.size()), pdoInfos.data(),
+                               EC_WD_DEFAULT};
+
+        if (ecrt_slave_config_pdos(sc, 1, &syncCfg) != 0) {
+            spdlog::warn("IGH: failed to apply {} PDO assignment on slave {} sync {}", label, pos, syncIdx);
+            return;
+        }
+
+        for (unsigned int pdoPos = 0; pdoPos < entryStorage.size(); ++pdoPos) {
+            for (unsigned int entryPos = 0; entryPos < entryStorage[pdoPos].size(); ++entryPos) {
+                auto& e = entryStorage[pdoPos][entryPos];
+                if (e.bit_length == 0 || e.index == 0) continue;
+
+                unsigned int bitPosition = 0;
+                int byteOffset =
+                    ecrt_slave_config_reg_pdo_entry_pos(sc, syncIdx, pdoPos, entryPos, domain_, &bitPosition);
+                if (byteOffset < 0) {
+                    spdlog::warn("IGH: failed to register {} PDO entry {:#06x}:{} on slave {}", label, e.index,
+                                 e.subindex, pos);
+                    continue;
+                }
+
+                SlaveVariable v;
+                v.index = e.index;
+                v.subIndex = e.subindex;
+                v.bitLength = e.bit_length;
+                v.bitOffset = static_cast<uint8_t>(bitPosition);
+                v.direction = dir;
+                v.dataType = GuessDataTypeFromBitLength(e.bit_length); // refined via ESI later
+                ds.variables.push_back(v);
+                pending_.push_back({slaves_.size(), ds.variables.size() - 1, byteOffset});
+            }
+        }
+    }
+
     // Scans the bus and (re)builds slaves_/pending_ from scratch. Must run
     // while the master is in idle phase (before the first activate(), or
     // just after a deactivate()) -- IGH's own docs: slave configuration
     // can't be altered once ecrt_master_activate() has run.
-    void rescan(const Config& cfg) {
+    void rescan(const Config& cfg, EsiRepository& esiRepo) {
         ec_master_info_t info{};
         if (ecrt_master(master_, &info) != 0) throw std::runtime_error("ecrt_master() failed to obtain master info");
 
@@ -193,51 +257,43 @@ private:
                     // the wire later, during the master's own state-
                     // transition sequence around activation) -- so build our
                     // own PDO/entry arrays from the override (already
-                    // resolved against ESI by main.cpp) and hand them
-                    // straight to ecrt_slave_config_pdos(), which both
-                    // configures the SM's CoE assignment for us and makes
-                    // exactly these entries available for registration.
-                    std::vector<std::vector<ec_pdo_entry_info_t>> entryStorage(overridePdos->size());
-                    std::vector<ec_pdo_info_t> pdoInfos(overridePdos->size());
-                    for (size_t i = 0; i < overridePdos->size(); ++i) {
-                        for (auto& e : (*overridePdos)[i].entries)
-                            entryStorage[i].push_back({e.index, e.subIndex, static_cast<uint8_t>(e.bitLen)});
-                        pdoInfos[i] = {(*overridePdos)[i].pdoIndex, static_cast<unsigned int>(entryStorage[i].size()),
-                                       entryStorage[i].empty() ? nullptr : entryStorage[i].data()};
-                    }
-                    ec_sync_info_t syncCfg{syncIdx, sync.dir, static_cast<unsigned int>(pdoInfos.size()),
-                                           pdoInfos.data(), EC_WD_DEFAULT};
-
-                    if (ecrt_slave_config_pdos(sc, 1, &syncCfg) != 0) {
-                        spdlog::warn("IGH: failed to apply custom PDO assignment on slave {} sync {}", pos, syncIdx);
-                    } else {
-                        for (unsigned int pdoPos = 0; pdoPos < entryStorage.size(); ++pdoPos) {
-                            for (unsigned int entryPos = 0; entryPos < entryStorage[pdoPos].size(); ++entryPos) {
-                                auto& e = entryStorage[pdoPos][entryPos];
-                                if (e.bit_length == 0 || e.index == 0) continue;
-
-                                unsigned int bitPosition = 0;
-                                int byteOffset = ecrt_slave_config_reg_pdo_entry_pos(sc, syncIdx, pdoPos, entryPos,
-                                                                                      domain_, &bitPosition);
-                                if (byteOffset < 0) {
-                                    spdlog::warn("IGH: failed to register overridden PDO entry {:#06x}:{} on slave {}",
-                                                 e.index, e.subindex, pos);
-                                    continue;
-                                }
-
-                                SlaveVariable v;
-                                v.index = e.index;
-                                v.subIndex = e.subindex;
-                                v.bitLength = e.bit_length;
-                                v.bitOffset = static_cast<uint8_t>(bitPosition);
-                                v.direction = dir;
-                                v.dataType = GuessDataTypeFromBitLength(e.bit_length);
-                                ds.variables.push_back(v);
-                                pending_.push_back({slaves_.size(), ds.variables.size() - 1, byteOffset});
-                            }
-                        }
-                    }
+                    // resolved against ESI by main.cpp) instead of trusting
+                    // live introspection for this sync manager.
+                    applyPdoList(sc, syncIdx, sync.dir, dir, pos, *overridePdos, ds, "overridden");
                     continue; // this sync manager is fully handled by the override
+                }
+
+                if (sync.n_pdos == 0) {
+                    // Live introspection found nothing to enumerate for this
+                    // sync manager -- e.g. a hardwired-mapping terminal with
+                    // neither a CoE mailbox nor an SII PDO-assignment
+                    // category (ecrt_master_get_sync_manager/_pdo/_pdo_entry
+                    // read from whichever of those the slave actually has;
+                    // some basic I/O terminals have neither). SOEM hits the
+                    // analogous case by falling back to an ESI-derived
+                    // mapping (see AddOpaqueFallback + main.cpp's
+                    // ExpandOpaqueFromEsi); IGH has no equivalent "opaque
+                    // buffer of N bytes" to fall back to (its introspection
+                    // struct carries no SM byte-length), so instead resolve
+                    // the device against ESI directly here and, if it
+                    // declares a default mapping for this direction, apply
+                    // that -- same source, applied a different way to fit
+                    // IGH's API.
+                    const EsiDevice* esiDevice =
+                        esiRepo.resolve(slaveInfo.vendor_id, slaveInfo.product_code, slaveInfo.revision_number);
+                    if (esiDevice) {
+                        std::vector<PdoOverridePdo> esiDefault;
+                        for (auto& p : esiDevice->pdos) {
+                            if (p.direction != dir) continue;
+                            PdoOverridePdo pdo;
+                            pdo.pdoIndex = p.index;
+                            for (auto& e : p.entries) pdo.entries.push_back({e.index, e.subIndex, e.bitLen});
+                            esiDefault.push_back(std::move(pdo));
+                        }
+                        if (!esiDefault.empty())
+                            applyPdoList(sc, syncIdx, sync.dir, dir, pos, esiDefault, ds, "ESI-default");
+                    }
+                    continue;
                 }
 
                 for (unsigned int pdoPos = 0; pdoPos < sync.n_pdos; ++pdoPos) {
