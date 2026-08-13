@@ -117,6 +117,7 @@ nlohmann::json SlaveDevice::GetMetadata() const {
     return {
         {"name", name_},
         {"description", description_},
+        {"state", ToString(slave_->alState)},
         {"reportedCsa", slave_->reportedCsa},
         {"ringCsa", slave_->ringCsa},
         {"pdos", pdos},

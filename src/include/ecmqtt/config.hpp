@@ -33,6 +33,14 @@ struct Config {
     // so this needs to be validated per-system rather than assumed safe.
     bool realtime = false;
 
+    // How long, in milliseconds, activate() waits for every slave to reach
+    // OPERATIONAL before giving up: SOEM fails the whole startup on
+    // timeout, IGH just warns and continues (see each backend's activate()
+    // for why the two differ). 2s is generous for a normal transition but
+    // can be too short on a large/slow-to-settle bus, especially right
+    // after a hotplug reconfigure.
+    uint32_t opWaitTimeoutMs = 2000;
+
     // Raw --pdo-config path, if given; main.cpp loads it and resolves entry
     // content from ESI into pdoOverrides before calling backend->configure().
     std::optional<std::string> pdoConfigPath;
@@ -53,6 +61,13 @@ struct Config {
     // a warning on backends where IEtherCatBackend::supportsHotplug() is
     // false.
     bool hotplug = false;
+
+    // Opt-in, only meaningful together with hotplug: when a reconfigure
+    // drops a slave that was previously known, also clear its retained MQTT
+    // state (metadata topic and any retained process-data topics) and
+    // unsubscribe from its output topics, instead of leaving them retained
+    // indefinitely under a CSA nothing will ever publish to again.
+    bool hotplugCleanup = false;
 };
 
 // Parses argv via cxxopts into a validated Config.

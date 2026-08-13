@@ -293,6 +293,17 @@ int main(int argc, char** argv) {
         for (auto& ds : backend->slaves()) {
             const ecmqtt::EsiDevice* esiDevice = esiRepo.resolve(ds.vendorId, ds.productCode, ds.revisionNo);
             std::string name = esiDevice && !esiDevice->name.empty() ? esiDevice->name : ds.liveName;
+            // Neither ESI nor the backend's own live introspection gave us
+            // anything to call this device -- fall back to its raw identity
+            // rather than publishing an empty string, so it's at least
+            // possible to tell which physical device this is and go find
+            // (or add) its ESI file.
+            if (name.empty()) {
+                name = fmt::format("{:#x}:{:#x}:{:#x}", ds.vendorId, ds.productCode, ds.revisionNo);
+                spdlog::warn("No ESI match and no live name for slave at ring position {} (vendor {:#x} product "
+                             "{:#x} rev {:#x})",
+                             ds.ringCsa, ds.vendorId, ds.productCode, ds.revisionNo);
+            }
             std::string description = esiDevice && !esiDevice->description.empty() ? esiDevice->description : name;
 
             ExpandOpaqueFromEsi(ds, esiDevice);
@@ -393,12 +404,13 @@ int main(int argc, char** argv) {
 
     // Publishes retained metadata + subscribes to output topics for every
     // current slave, and republishes bridge/info. Called on every MQTT
-    // (re)connect, and again after a hotplug reconfigure picks up a new
-    // topology. Only takes ecMutex long enough to snapshot what's needed
-    // from `devices` -- the actual publish/subscribe calls (network I/O)
-    // run unlocked, same reasoning as decoupling MQTT from the EtherCAT
-    // cycle thread elsewhere: a slow broker must never hold up updateIO().
-    auto publishMetadataAndSubscribe = [&]() {
+    // (re)connect, and again before/after a hotplug reconfigure picks up a
+    // new topology (see the "state" field below). Only takes ecMutex long
+    // enough to snapshot what's needed from `devices` -- the actual
+    // publish/subscribe calls (network I/O) run unlocked, same reasoning as
+    // decoupling MQTT from the EtherCAT cycle thread elsewhere: a slow
+    // broker must never hold up updateIO().
+    auto publishMetadataAndSubscribe = [&](const std::string& state = "running") {
         struct Entry {
             uint16_t csa;
             nlohmann::json meta;
@@ -424,12 +436,14 @@ int main(int argc, char** argv) {
             slaveSummary[std::to_string(meta["ringCsa"].get<uint16_t>())] = {
                 {"name", meta["name"]},
                 {"description", meta["description"]},
+                {"state", meta["state"]},
                 {"reportedCsa", meta["reportedCsa"]},
                 {"ringCsa", meta["ringCsa"]},
             };
         }
 
         nlohmann::json info = {
+            {"state", state}, // "running", or during a hotplug reconfigure: "rescanning" then "waiting"
             {"interface", cfg.interface},
             {"frequency_hz", cfg.frequencyHz},
             {"esi_path", esiDir},
@@ -516,6 +530,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // The very first publishMetadataAndSubscribe() call (via setOnConnect,
+    // above) necessarily ran before activate() -- each slave's alState is
+    // only known afterward. Republish now that it is, so "state" in
+    // retained metadata reflects reality instead of permanently reading
+    // Unknown on a run that never hits a hotplug reconfigure (the only
+    // other thing that republishes).
+    publishMetadataAndSubscribe();
+
     spdlog::info("Press Ctrl+C to exit.");
 
     if (cfg.hotplug && !backend->supportsHotplug())
@@ -599,6 +621,15 @@ int main(int argc, char** argv) {
                 if (backend->topologyChanged()) {
                     spdlog::info(
                         "EtherCAT topology change detected; reconfiguring (all slaves briefly pause)...");
+                    publishMetadataAndSubscribe("rescanning");
+
+                    std::vector<uint16_t> oldCsas;
+                    {
+                        std::lock_guard<std::mutex> lock(ecMutex);
+                        oldCsas.reserve(devices.size());
+                        for (auto& d : devices) oldCsas.push_back(d.GetCsa(cfg.useReportedCsa));
+                    }
+
                     try {
                         backend->reconfigure(cfg, esiRepo);
                     } catch (const std::exception& ex) {
@@ -608,13 +639,68 @@ int main(int argc, char** argv) {
                         break;
                     }
 
+                    // reconfigure() just cleared and repopulated the
+                    // backend's own slave storage -- every SlaveDevice in
+                    // the *old* `devices` holds a pointer into that now-
+                    // destroyed storage. Rebuild `devices` immediately,
+                    // before touching it for anything (even just publishing
+                    // a "waiting" status): with every slave removed, every
+                    // entry would be dangling and this crashes reliably;
+                    // with only some removed it's still equally undefined
+                    // behavior, just not guaranteed to fault every time.
                     auto newDevices = buildDevices();
+                    std::vector<uint16_t> newCsas;
+                    newCsas.reserve(newDevices.size());
+                    for (auto& d : newDevices) newCsas.push_back(d.GetCsa(cfg.useReportedCsa));
                     {
                         std::lock_guard<std::mutex> lock(ecMutex);
                         devices = std::move(newDevices);
                     }
+
+                    // Safe to publish/subscribe against `devices` here even
+                    // though activate() hasn't run yet: SlaveDevice reads
+                    // straight through to the backend's live DiscoveredSlave
+                    // storage, and GetMetadata() only touches name/
+                    // description/state/pdo-list fields, none of which need
+                    // a resolved dataPtr (that only matters for actually
+                    // reading/writing process data, filtered out of
+                    // GetAllVariables() et al. until activate() sets it).
+                    publishMetadataAndSubscribe("waiting"); // rescanned; bringing slaves back to OP
+
+                    try {
+                        backend->activate();
+                    } catch (const std::exception& ex) {
+                        spdlog::critical("Failed to reactivate EtherCAT master after a topology change: {}",
+                                          ex.what());
+                        exitCode = 1;
+                        break;
+                    }
+
                     spdlog::info("Reconfigured: {} slave(s) now known", devices.size());
-                    publishMetadataAndSubscribe();
+
+                    if (cfg.hotplugCleanup) {
+                        for (uint16_t csa : oldCsas) {
+                            if (std::find(newCsas.begin(), newCsas.end(), csa) != newCsas.end()) continue;
+
+                            mqtt.unsubscribe(fmt::format("{}/{}/+/+", cfg.topic, csa));
+                            mqtt.publish(fmt::format("{}/{}/metadata", cfg.topic, csa), "", 1, true);
+
+                            std::string prefix = fmt::format("{}/{}/", cfg.topic, csa);
+                            std::vector<std::string> topicsToClear;
+                            {
+                                std::lock_guard<std::mutex> lock(cacheMutex);
+                                for (auto& [topic, value] : cache)
+                                    if (topic.rfind(prefix, 0) == 0) topicsToClear.push_back(topic);
+                                for (auto& topic : topicsToClear) cache.erase(topic);
+                            }
+                            for (auto& topic : topicsToClear) mqtt.publish(topic, "", 1, true);
+
+                            spdlog::info("Cleared MQTT state for removed slave CSA={} ({} retained topic(s))", csa,
+                                         topicsToClear.size() + 1);
+                        }
+                    }
+
+                    publishMetadataAndSubscribe("running");
 
                     // reconfigure() took nontrivial wall-clock time; resume
                     // from now rather than firing a burst of "missed" ticks.

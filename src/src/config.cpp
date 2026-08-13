@@ -46,12 +46,16 @@ std::optional<Config> ParseArgs(int argc, char** argv) {
         ("realtime", "Request SCHED_FIFO + mlockall for the cycle thread. Validate on your target first: "
                      "on some systems this can starve the kernel's own EtherCAT master thread instead of helping.",
          cxxopts::value<bool>()->default_value("false"))
+        ("op-timeout", "Milliseconds to wait for all slaves to reach OPERATIONAL after activation before "
+                       "giving up. SOEM fails startup on timeout; IGH warns and continues (also applies "
+                       "after every --hotplug reconfigure on IGH).",
+         cxxopts::value<uint32_t>()->default_value("2000"))
         ("pdo-config", "Path to a JSON file selecting a non-default PDO assignment for specific slaves "
                        "(matched by vendor/product/revision), picking an alternate RxPdo/TxPdo declared in "
                        "their ESI file instead of whatever's currently active.", cxxopts::value<std::string>())
 #if defined(EC_BACKEND_SOEM)
         ("write-alias", "Write a persistent SII station alias to one or more slaves addressed by their "
-                        "current ring position, then exit -- does not run the bridge. Format: "
+                        "current ring position, then exit. Format: "
                         "<ringPos>=<alias>[,<ringPos>=<alias>...]. Requires power-cycling the slave(s) for "
                         "the new alias to take effect.",
          cxxopts::value<std::string>())
@@ -59,7 +63,11 @@ std::optional<Config> ParseArgs(int argc, char** argv) {
 #if defined(EC_BACKEND_IGH)
         ("hotplug", "Periodically check for hot-plugged/removed slaves and reconfigure to pick them up. "
                     "Briefly pauses cyclic servicing for every slave (not just the one that changed) each "
-                    "time it reconfigures -- see --help output or README for details.",
+                    "time it reconfigures.",
+         cxxopts::value<bool>()->default_value("false"))
+        ("hotplug-cleanup", "With --hotplug, also clear a removed slave's retained MQTT metadata and "
+                            "process-data topics and unsubscribe from its outputs, instead of leaving them "
+                            "retained under a CSA nothing will publish to again.",
          cxxopts::value<bool>()->default_value("false"))
 #endif
         ("h,help", "Print usage.");
@@ -94,12 +102,14 @@ std::optional<Config> ParseArgs(int argc, char** argv) {
     cfg.clientId = result["client-id"].as<std::string>();
     cfg.useReportedCsa = result["use-reported-csa"].as<bool>();
     cfg.realtime = result["realtime"].as<bool>();
+    cfg.opWaitTimeoutMs = result["op-timeout"].as<uint32_t>();
     if (result.count("pdo-config")) cfg.pdoConfigPath = result["pdo-config"].as<std::string>();
 #if defined(EC_BACKEND_SOEM)
     if (result.count("write-alias")) cfg.writeAlias = result["write-alias"].as<std::string>();
 #endif
 #if defined(EC_BACKEND_IGH)
     cfg.hotplug = result["hotplug"].as<bool>();
+    cfg.hotplugCleanup = result["hotplug-cleanup"].as<bool>();
 #endif
 
     if (cfg.port <= 0 || cfg.port > 65535)

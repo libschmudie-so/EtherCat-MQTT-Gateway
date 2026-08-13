@@ -109,4 +109,26 @@ const char* ToString(DataDirection dir) {
     return dir == DataDirection::Input ? "Input" : "Output";
 }
 
+SlaveAlState SlaveAlStateFromRaw(uint8_t raw) {
+    switch (raw & 0x0F) {
+        case 0x01: return SlaveAlState::Init;
+        case 0x02: return SlaveAlState::PreOp;
+        case 0x03: return SlaveAlState::Boot;
+        case 0x04: return SlaveAlState::SafeOp;
+        case 0x08: return SlaveAlState::Op;
+        default: return SlaveAlState::Unknown;
+    }
+}
+
+const char* ToString(SlaveAlState state) {
+    switch (state) {
+        case SlaveAlState::Init: return "INIT";
+        case SlaveAlState::PreOp: return "PREOP";
+        case SlaveAlState::Boot: return "BOOT";
+        case SlaveAlState::SafeOp: return "SAFEOP";
+        case SlaveAlState::Op: return "OP";
+        default: return "UNKNOWN";
+    }
+}
+
 } // namespace ecmqtt

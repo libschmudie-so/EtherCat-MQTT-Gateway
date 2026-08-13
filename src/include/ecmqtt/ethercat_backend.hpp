@@ -46,6 +46,12 @@ struct DiscoveredSlave {
     uint32_t productCode = 0;
     uint32_t revisionNo = 0;
     std::string liveName;          // name reported directly by the stack, if any
+    // Snapshotted right after activate() -- reflects what was actually
+    // reached (still SAFEOP/PREOP if the post-activation OP wait timed
+    // out), not a continuously-updated live value. Republished only when
+    // metadata is (i.e. on connect and after a hotplug reconfigure), same
+    // as the rest of a slave's metadata.
+    SlaveAlState alState = SlaveAlState::Unknown;
     std::vector<SlaveVariable> variables;
 };
 
@@ -130,6 +136,13 @@ public:
     // failure, same as configure()/activate() -- the caller should treat
     // that as fatal, since the old topology is already gone by the time
     // this can fail.
+    //
+    // Mirrors configure(): does not call activate() itself. The caller must
+    // call activate() again afterward to bring the freshly-rescanned slaves
+    // back to OPERATIONAL before resuming updateIO() -- splitting the two
+    // gives the caller a hook point in between (e.g. to publish a
+    // "reconfigured, coming back up" status) the same way it already has
+    // one between the initial configure() and activate().
     virtual void reconfigure(const Config& cfg, EsiRepository& esiRepo) {
         (void)cfg;
         (void)esiRepo;

@@ -37,6 +37,7 @@ public:
 
     void publish(const std::string& topic, const std::string& payload, int qos = 1, bool retain = false);
     void subscribe(const std::string& filter, int qos = 1);
+    void unsubscribe(const std::string& filter);
 
     bool isConnected() const { return connected_; }
 

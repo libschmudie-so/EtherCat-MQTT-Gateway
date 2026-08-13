@@ -96,7 +96,14 @@ private:
         }
     };
     struct IndexedFile {
-        std::string hash;
+        // Cheap change-detection: a size+mtime match is trusted as "file
+        // hasn't changed" without re-reading its content (see refreshIndex())
+        // -- much faster than re-hashing every ESI file's full content on
+        // every startup, which is the dominant cost in a large ESI
+        // collection (thousands of files, some multi-MB) once everything's
+        // already indexed and nothing actually changed.
+        uintmax_t size = 0;
+        int64_t mtime = 0; // filesystem::file_time_type::rep at index time
         std::vector<Key> deviceKeys;
     };
 

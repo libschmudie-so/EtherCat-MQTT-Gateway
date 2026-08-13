@@ -5,6 +5,7 @@
 // mailbox fall back to one opaque variable per direction spanning the whole
 // mapped buffer.
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <stdexcept>
@@ -195,6 +196,7 @@ public:
     // entirely in main.cpp's ExpandOpaqueFromEsi, after this returns.
     void configure(const Config& cfg, EsiRepository& esiRepo) override {
         (void)esiRepo;
+        opWaitTimeoutMs_ = cfg.opWaitTimeoutMs;
         if (ec_init(cfg.interface.c_str()) <= 0)
             throw std::runtime_error("ec_init failed for interface '" + cfg.interface +
                                       "' (check the name and NET_RAW/NET_ADMIN permissions)");
@@ -226,6 +228,12 @@ public:
             ds.productCode = ec_slave[i].eep_id;
             ds.revisionNo = ec_slave[i].eep_rev;
             ds.liveName = ec_slave[i].name;
+            // As-of-scan-time state (typically SAFE-OP here, from the
+            // ec_statecheck() a few lines up) -- activate() overwrites this
+            // with the actually-reached state once it runs. Populating it
+            // now means a metadata publish that lands before activate()
+            // still shows something real instead of always Unknown.
+            ds.alState = SlaveAlStateFromRaw(static_cast<uint8_t>(ec_slave[i].state));
 
             // A direction's assign object (0x1C12/0x1C13) reading fine is not
             // enough: some slaves report a valid assign list but their
@@ -264,7 +272,9 @@ public:
         ec_receive_processdata(EC_TIMEOUTRET);
         ec_writestate(0);
 
-        int chk = 40;
+        // Each ec_statecheck() call below times out after 50ms on its own,
+        // so --op-timeout / 50ms is how many of those we get to try.
+        int chk = std::max<int>(1, static_cast<int>(opWaitTimeoutMs_ / 50));
         do {
             ec_send_processdata();
             ec_receive_processdata(EC_TIMEOUTRET);
@@ -275,6 +285,12 @@ public:
             ec_close();
             throw std::runtime_error("Not all EtherCAT slaves reached OPERATIONAL state");
         }
+
+        // ec_statecheck() above only tracks the aggregate state at index 0;
+        // refresh every individual slave's ec_slave[i].state (for metadata,
+        // see DiscoveredSlave::alState) with a dedicated read.
+        ec_readstate();
+        for (int i = 1; i <= ec_slavecount; ++i) slaves_[i - 1].alState = SlaveAlStateFromRaw(ec_slave[i].state);
 
         spdlog::info("SOEM: {} slave(s) at OPERATIONAL", ec_slavecount);
     }
@@ -352,7 +368,7 @@ public:
             }
             spdlog::info(
                 "Wrote alias {:#06x} to slave at ring position {}. Power-cycle that slave for the new alias "
-                "to take effect -- it's latched by the EtherCAT slave controller at reset, not live.",
+                "to take effect; it's latched by the EtherCAT slave controller at reset, not live.",
                 alias, ringPos);
         }
 
@@ -362,6 +378,7 @@ public:
 
 private:
     std::array<char, kIoMapSize> ioMap_{};
+    uint32_t opWaitTimeoutMs_ = 2000;
     std::vector<DiscoveredSlave> slaves_;
 };
 

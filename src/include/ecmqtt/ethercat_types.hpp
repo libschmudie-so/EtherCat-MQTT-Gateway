@@ -22,6 +22,25 @@ enum class DataDirection {
     Output, // master -> slave (RxPDO), writable via MQTT
 };
 
+// A slave's EtherCAT application-layer (AL) state, ETG.1000.6 encoding --
+// the same values both backends' live introspection reports (IGH:
+// ec_slave_info_t::al_state; SOEM: ec_slave[]::state, low nibble).
+enum class SlaveAlState : uint8_t {
+    Unknown = 0,
+    Init = 1,
+    PreOp = 2,
+    Boot = 3,
+    SafeOp = 4,
+    Op = 8,
+};
+
+// Maps a raw AL status byte to the enum, masking off bit 4 (the "error
+// indication acknowledge" flag ETG.1000 defines alongside the state in the
+// same byte) first. Unrecognized values map to Unknown.
+SlaveAlState SlaveAlStateFromRaw(uint8_t raw);
+
+const char* ToString(SlaveAlState state);
+
 // Best-effort mapping from an ESI <DataType> string (e.g. "BOOL", "UINT16",
 // "REAL32") to our enum. Falls back to Unknown for anything unrecognized.
 EthercatDataType EsiDataTypeFromString(const std::string& esiType);

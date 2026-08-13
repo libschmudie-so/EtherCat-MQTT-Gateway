@@ -66,6 +66,12 @@ void MqttClient::subscribe(const std::string& filter, int qos) {
         spdlog::warn("Subscribe failed for {}: {}", filter, mosquitto_strerror(rc));
 }
 
+void MqttClient::unsubscribe(const std::string& filter) {
+    int rc = mosquitto_unsubscribe(mosq_, nullptr, filter.c_str());
+    if (rc != MOSQ_ERR_SUCCESS)
+        spdlog::warn("Unsubscribe failed for {}: {}", filter, mosquitto_strerror(rc));
+}
+
 void MqttClient::disconnect() {
     connected_ = false;
     mosquitto_disconnect(mosq_);

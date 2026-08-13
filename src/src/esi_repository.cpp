@@ -1,7 +1,6 @@
 #include "ecmqtt/esi_repository.hpp"
 
 #include <algorithm>
-#include <array>
 #include <cctype>
 #include <chrono>
 #include <filesystem>
@@ -43,34 +42,6 @@ uint32_t ParseEsiNumber(const std::string& sIn) {
 }
 
 namespace {
-
-// CRC-32 (IEEE 802.3) over a file's raw bytes -- used purely for local
-// change detection (has this file changed since the index was written?),
-// not as a security hash, so a lightweight, dependency-free checksum is
-// enough; no need to pull in a real MD5/SHA implementation for that.
-uint32_t Crc32(const std::string& path) {
-    static const auto table = [] {
-        std::array<uint32_t, 256> t{};
-        for (uint32_t i = 0; i < 256; ++i) {
-            uint32_t c = i;
-            for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-            t[i] = c;
-        }
-        return t;
-    }();
-
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return 0;
-
-    uint32_t crc = 0xFFFFFFFFu;
-    char buf[8192];
-    while (f.read(buf, sizeof(buf)) || f.gcount() > 0) {
-        auto n = f.gcount();
-        for (std::streamsize i = 0; i < n; ++i)
-            crc = table[(crc ^ static_cast<uint8_t>(buf[i])) & 0xFF] ^ (crc >> 8);
-    }
-    return crc ^ 0xFFFFFFFFu;
-}
 
 void ParsePdoBlock(tinyxml2::XMLElement* deviceEl, const char* tag, DataDirection dir,
                     std::vector<EsiPdo>& out) {
@@ -220,18 +191,28 @@ void EsiRepository::refreshIndex(const std::string& dir) {
         if (ext != ".xml") continue;
 
         std::string path = entry.path().string();
-        std::string hash = std::to_string(Crc32(path));
+
+        // A size+mtime match is trusted as "unchanged" without reading the
+        // file at all -- directory_iterator's entry already has these
+        // cached from the readdir/stat it just did.
+        std::error_code statEc;
+        uintmax_t size = entry.file_size(statEc);
+        int64_t mtime = statEc ? 0 : entry.last_write_time(statEc).time_since_epoch().count();
 
         auto it = fileIndex_.find(path);
-        if (it != fileIndex_.end() && it->second.hash == hash) {
+        if (!statEc && it != fileIndex_.end() && it->second.size == size && it->second.mtime == mtime) {
             refreshed.emplace(path, std::move(it->second));
             ++reused;
             continue;
         }
 
+        auto fileStart = std::chrono::steady_clock::now();
         IndexedFile idx;
-        idx.hash = hash;
+        idx.size = size;
+        idx.mtime = mtime;
         idx.deviceKeys = ExtractDeviceKeys(path);
+        auto fileMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fileStart).count();
+        spdlog::info("ESI index: loaded {} ({:.0f}ms)", entry.path().filename().string(), fileMs);
         refreshed.emplace(path, std::move(idx));
         ++reparsed;
     }
@@ -268,7 +249,8 @@ void EsiRepository::loadIndex(const std::string& path) {
     nlohmann::json files = j.value("files", nlohmann::json::object());
     for (auto& [filePath, fj] : files.items()) {
         IndexedFile idx;
-        idx.hash = fj.value("hash", "");
+        idx.size = fj.value("size", uintmax_t{0});
+        idx.mtime = fj.value("mtime", int64_t{0});
         for (auto& dj : fj.value("devices", nlohmann::json::array()))
             idx.deviceKeys.push_back(
                 {dj.value("vendorId", 0u), dj.value("productCode", 0u), dj.value("revisionNo", 0u)});
@@ -294,7 +276,7 @@ void EsiRepository::saveIndex(const std::string& path) const {
         for (auto& key : idx.deviceKeys)
             devicesJson.push_back(
                 {{"vendorId", key.vendorId}, {"productCode", key.productCode}, {"revisionNo", key.revisionNo}});
-        filesJson[filePath] = {{"hash", idx.hash}, {"devices", devicesJson}};
+        filesJson[filePath] = {{"size", idx.size}, {"mtime", idx.mtime}, {"devices", devicesJson}};
     }
 
     nlohmann::json j;

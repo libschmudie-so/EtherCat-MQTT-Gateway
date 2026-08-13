@@ -3,17 +3,21 @@
 // currently-assigned PDO mapping (its SII/EEPROM default, same source SOEM's
 // default config uses), then registers each entry by position
 // (ecrt_slave_config_reg_pdo_entry_pos) to obtain a byte offset into a
-// single shared domain. Verified against the IGH 1.6.8 ecrt.h found on this
-// machine; re-check struct/field names against your installed header if a
-// different IGH version renames anything here.
+// single shared domain. Struct layouts/field names checked directly against
+// igh-ethercat-1.6.8/include/ecrt.h (ec_slave_info_t, ec_master_info_t,
+// ec_sync_info_t, ec_pdo_info_t, ec_pdo_entry_info_t); re-check against your
+// installed header if a different IGH version renames anything here.
 //
 // ec_pdo_info_t/ec_pdo_entry_info_t carry no name field -- IGH's live
 // introspection, like SOEM's, has no human-readable PDO names. That's why
 // ESI-file metadata is required for both backends, not just SOEM.
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <ecrt.h>
@@ -44,10 +48,11 @@ public:
         // cfg.interface is unused: IGH addresses slaves via its own
         // preconfigured master/device, not an --iface name. cfg.pdoOverrides
         // is used below.
+        opWaitTimeoutMs_ = cfg.opWaitTimeoutMs;
         master_ = ecrt_request_master(0);
         if (!master_)
             throw std::runtime_error(
-                "ecrt_request_master(0) failed -- is the ethercat master service running and device configured?");
+                "ecrt_request_master(0) failed. Is the ethercat master service running and device configured?");
 
         domain_ = ecrt_master_create_domain(master_);
         if (!domain_) throw std::runtime_error("ecrt_master_create_domain failed");
@@ -75,6 +80,64 @@ public:
         for (const auto& p : pending_)
             slaves_[p.slaveArrIdx].variables[p.varIdx].dataPtr = domainBase + p.byteOffset;
         pending_.clear();
+
+        // ecrt_master_activate() only starts the cyclic phase -- unlike
+        // SOEM's activate() (a blocking ec_statecheck loop), each slave's AL
+        // state here only actually advances toward OP as the app keeps
+        // driving receive/(process/queue)/send, the same exchange the real
+        // cyclic loop runs afterward. Drive it here too and wait for every
+        // slave to reach OP before returning, so a caller (main.cpp, after a
+        // hotplug reconfigure in particular) doesn't treat the master as
+        // ready before it actually is. Warn rather than throw on timeout:
+        // one slow-to-come-up slave after a reconfigure shouldn't take the
+        // whole gateway down (see the ecrt_domain_data null case above for
+        // the same reasoning).
+        //
+        // Nothing to wait for with zero slaves -- and ecrt_domain_process()/
+        // ecrt_domain_queue() are specifically skipped whenever domainBase
+        // is null (a zero-size domain, same condition as above): unlike
+        // ecrt_master_receive()/_send(), which operate on the whole master
+        // regardless of domain content, these two are domain-specific calls
+        // this code was never previously exercising with an empty domain --
+        // updateIO() is the only other caller, and it only ever runs once
+        // there's at least one slave. Untested territory otherwise.
+        if (!slaves_.empty()) {
+            constexpr uint8_t kAlStateOp = 0x08;
+            const int maxChecks = std::max<int>(1, static_cast<int>(opWaitTimeoutMs_ / 50));
+            bool allOp = false;
+            for (int check = 0; check < maxChecks && !allOp; ++check) {
+                ecrt_master_receive(master_);
+                if (domainBase) {
+                    ecrt_domain_process(domain_);
+                    ecrt_domain_queue(domain_);
+                }
+                ecrt_master_send(master_);
+
+                allOp = true;
+                for (unsigned int pos = 0; pos < slaves_.size(); ++pos) {
+                    ec_slave_info_t si{};
+                    if (ecrt_master_get_slave(master_, static_cast<uint16_t>(pos), &si) != 0 ||
+                        si.al_state != kAlStateOp) {
+                        allOp = false;
+                        break;
+                    }
+                }
+                if (!allOp) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            if (!allOp)
+                spdlog::warn("IGH: not all slaves reached OPERATIONAL within the timeout after activation");
+
+            // Record each slave's actually-reached AL state for metadata
+            // (DiscoveredSlave::alState) -- a dedicated final pass rather
+            // than reusing whatever the loop above last saw, since it
+            // breaks out of its per-slave scan on the first non-OP slave
+            // and so doesn't necessarily have a fresh read for every one.
+            for (unsigned int pos = 0; pos < slaves_.size(); ++pos) {
+                ec_slave_info_t si{};
+                if (ecrt_master_get_slave(master_, static_cast<uint16_t>(pos), &si) == 0)
+                    slaves_[pos].alState = SlaveAlStateFromRaw(si.al_state);
+            }
+        }
 
         spdlog::info("IGH: master activated");
     }
@@ -126,8 +189,13 @@ public:
 
     // See the base class doc comment for the deactivate/rescan/reactivate
     // cost this incurs -- unavoidable given IGH's documented API contract.
+    // Mirrors configure(): only rescans, doesn't activate() -- the caller
+    // calls activate() separately afterward (same as it does after
+    // configure()), which gives it a hook point between "bus rescanned" and
+    // "slaves back at OP" to publish something in between if it wants to.
     void reconfigure(const Config& cfg, EsiRepository& esiRepo) override {
         spdlog::info("IGH: topology change detected, reconfiguring ({} slave(s) currently)...", slaves_.size());
+        opWaitTimeoutMs_ = cfg.opWaitTimeoutMs;
 
         if (ecrt_master_deactivate(master_) != 0) throw std::runtime_error("ecrt_master_deactivate failed");
 
@@ -141,7 +209,6 @@ public:
         if (!domain_) throw std::runtime_error("ecrt_master_create_domain failed");
 
         rescan(cfg, esiRepo);
-        activate();
     }
 
 private:
@@ -209,6 +276,27 @@ private:
         ec_master_info_t info{};
         if (ecrt_master(master_, &info) != 0) throw std::runtime_error("ecrt_master() failed to obtain master info");
 
+        // The master runs its own bus scan asynchronously (info.scan_busy)
+        // -- right after ecrt_request_master(), or after a topology change,
+        // slave_count can already reflect newly-seen slaves before their
+        // SII EEPROM read (vendor/product/revision/name) has actually
+        // finished. Querying a slave mid-scan doesn't fail
+        // (ecrt_master_get_slave() still returns 0); it just hands back a
+        // zeroed/incomplete ec_slave_info_t for that one. Waiting here for
+        // scan_busy to clear is what makes slave_count and every per-slave
+        // query below reflect a settled topology.
+        auto scanWaitStart = std::chrono::steady_clock::now();
+        while (info.scan_busy) {
+            if (std::chrono::steady_clock::now() - scanWaitStart > std::chrono::seconds(30)) {
+                spdlog::warn("IGH: master bus scan still in progress after 30s; proceeding anyway. Some slaves "
+                             "may show up with an incomplete identity.");
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (ecrt_master(master_, &info) != 0)
+                throw std::runtime_error("ecrt_master() failed to obtain master info");
+        }
+
         slaves_.reserve(info.slave_count);
 
         for (unsigned int pos = 0; pos < info.slave_count; ++pos) {
@@ -227,11 +315,21 @@ private:
             ds.productCode = slaveInfo.product_code;
             ds.revisionNo = slaveInfo.revision_number;
             ds.liveName = slaveInfo.name;
+            // As-of-scan-time state -- typically still INIT/PREOP/SAFEOP
+            // here, well before activate() brings it to OP (which
+            // overwrites this with the actually-reached state once it
+            // runs). Populating it now rather than leaving it Unknown means
+            // a metadata publish that lands before activate() -- e.g.
+            // main.cpp's "rescanning"/"waiting" hotplug states -- still
+            // shows something real instead of always Unknown.
+            ds.alState = SlaveAlStateFromRaw(slaveInfo.al_state);
 
             ec_slave_config_t* sc = ecrt_master_slave_config(master_, /*alias=*/0, static_cast<uint16_t>(pos),
                                                               slaveInfo.vendor_id, slaveInfo.product_code);
             if (!sc) {
-                spdlog::warn("IGH: ecrt_master_slave_config failed for slave {} ({})", pos, ds.liveName);
+                spdlog::warn("IGH: ecrt_master_slave_config failed for slave {} ('{}', vendor {:#x} product {:#x} "
+                             "rev {:#x})",
+                             pos, ds.liveName, ds.vendorId, ds.productCode, ds.revisionNo);
                 slaves_.push_back(std::move(ds));
                 continue;
             }
@@ -347,6 +445,7 @@ private:
 
     ec_master_t* master_ = nullptr;
     ec_domain_t* domain_ = nullptr;
+    uint32_t opWaitTimeoutMs_ = 2000;
     std::vector<DiscoveredSlave> slaves_;
     std::vector<PendingOffset> pending_;
 };
