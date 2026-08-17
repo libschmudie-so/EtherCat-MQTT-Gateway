@@ -51,7 +51,21 @@ struct DiscoveredSlave {
     // out), not a continuously-updated live value. Republished only when
     // metadata is (i.e. on connect and after a hotplug reconfigure), same
     // as the rest of a slave's metadata.
+    // Refreshed every updateIO() call via each backend's RT-safe state
+    // query (IGH: ecrt_slave_config_state(); SOEM: ec_readstate()) -- not
+    // just a snapshot from the last activate()/hotplug reconfigure, so this
+    // reflects reality even if a slave's state changes mid-run.
     SlaveAlState alState = SlaveAlState::Unknown;
+    // The slave's AL Status Code (ESC register 0x0134, ETG.1000.6 Annex),
+    // e.g. 0x001E for "Invalid input configuration" -- see
+    // ecmqtt::AlStatusMessage() for the human-readable text. 0 ("No
+    // error") is a normal value, not "unset"/"unknown". IGH: read via a
+    // register request (ecrt_slave_config_create_reg_request() +
+    // ecrt_reg_request_read()), the same RT-safe mechanism alState now
+    // uses, re-armed continuously from updateIO(). SOEM: ec_slave[]::
+    // ALstatuscode, already populated locally by ec_readstate().
+    uint16_t alStatusCode = 0;
+    bool alError = false; // alStatusCode != 0 -- kept as a separate bool for a quick check without the code/text
     std::vector<SlaveVariable> variables;
 };
 

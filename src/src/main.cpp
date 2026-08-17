@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -103,30 +104,79 @@ void ExpandOpaqueFromEsi(ecmqtt::DiscoveredSlave& ds, const ecmqtt::EsiDevice* e
     ds.variables = std::move(expanded);
 }
 
+bool EqualsIgnoreCase(const std::string& a, const std::string& b) {
+    return a.size() == b.size() &&
+           std::equal(a.begin(), a.end(), b.begin(),
+                      [](unsigned char x, unsigned char y) { return std::tolower(x) == std::tolower(y); });
+}
+
+// Lists every PDO ESI declares for a device+direction, as "index" or
+// "index \"name\"", for the no-match warning below -- so finding the right
+// selector is "read the warning" rather than "go open the ESI XML".
+std::string AvailablePdoOptions(const ecmqtt::EsiDevice& dev, ecmqtt::DataDirection dir) {
+    std::string out;
+    for (auto& p : dev.pdos) {
+        if (p.direction != dir) continue;
+        if (!out.empty()) out += ", ";
+        out += fmt::format("{:#06x}", p.index);
+        if (!p.name.empty()) out += fmt::format(" \"{}\"", p.name);
+    }
+    return out.empty() ? "(none declared for this direction)" : out;
+}
+
 // Fills in .rxPdos/.txPdos (index + entries) for each override by matching
 // its (vendorId, productCode, revisionNo) against a loaded ESI device and
-// picking out the requested RxPdo/TxPdo blocks by index. Leaves a PDO's
-// entries empty (backends then fall back to the slave's own default entries
-// for that PDO index, still selecting the right one) when no ESI match is
+// resolving each requested RxPdo/TxPdo selector -- a hex/decimal index or a
+// declared ESI name (e.g. an EL3012's "Full"/"Simple"), matched
+// case-insensitively -- against that device's PDOs. Leaves a PDO's entries
+// empty (backends then fall back to the slave's own default entries for
+// that PDO index, still selecting the right one) when no ESI match is
 // found -- logged, not fatal, since the assignment itself can still be
 // attempted on the wire.
 void ResolvePdoOverrides(std::vector<ecmqtt::PdoOverride>& overrides, ecmqtt::EsiRepository& esiRepo) {
-    auto resolveDirection = [](const ecmqtt::EsiDevice* dev, const std::vector<uint16_t>& indices,
+    auto resolveDirection = [](const ecmqtt::EsiDevice* dev, const std::vector<std::string>& selectors,
                                 ecmqtt::DataDirection dir, std::vector<ecmqtt::PdoOverridePdo>& out) {
-        for (uint16_t pdoIndex : indices) {
+        for (const std::string& selector : selectors) {
             ecmqtt::PdoOverridePdo pdo;
-            pdo.pdoIndex = pdoIndex;
+            // 0 is never a real PDO index -- ParseEsiNumber()'s fallback
+            // for a selector that isn't numeric at all (a name). Set this
+            // unconditionally, ESI or not, so a numeric selector still
+            // gets attempted blind on the wire without an ESI match, same
+            // as before name-based selectors existed.
+            pdo.pdoIndex = static_cast<uint16_t>(ecmqtt::ParseEsiNumber(selector));
 
             const ecmqtt::EsiPdo* match = nullptr;
             if (dev) {
-                for (auto& p : dev->pdos)
-                    if (p.index == pdoIndex && p.direction == dir) { match = &p; break; }
+                if (pdo.pdoIndex != 0)
+                    for (auto& p : dev->pdos)
+                        if (p.index == pdo.pdoIndex && p.direction == dir) { match = &p; break; }
+                if (!match)
+                    for (auto& p : dev->pdos)
+                        if (p.direction == dir && !p.name.empty() && EqualsIgnoreCase(p.name, selector)) {
+                            match = &p;
+                            break;
+                        }
             }
             if (match) {
+                pdo.pdoIndex = match->index; // resolves a name selector to its real numeric index too
                 for (auto& e : match->entries) pdo.entries.push_back({e.index, e.subIndex, e.bitLen});
+                spdlog::debug("--pdo-config: '{}' resolved to PDO {:#06x} ({} entries: {})", selector, match->index,
+                              match->entries.size(), [&] {
+                                  std::string s;
+                                  for (auto& e : match->entries)
+                                      s += fmt::format("{}{:#06x}:{:#04x}/{}", s.empty() ? "" : ", ", e.index,
+                                                        e.subIndex, e.bitLen);
+                                  return s;
+                              }());
             } else if (dev) {
-                spdlog::warn("--pdo-config: PDO {:#06x} not found in ESI for vendor {:#x} product {:#x} rev {:#x}",
-                             pdoIndex, dev->vendorId, dev->productCode, dev->revisionNo);
+                spdlog::warn(
+                    "--pdo-config: '{}' not found in ESI for vendor {:#x} product {:#x} rev {:#x}. Available: {}",
+                    selector, dev->vendorId, dev->productCode, dev->revisionNo, AvailablePdoOptions(*dev, dir));
+            } else if (pdo.pdoIndex == 0) {
+                spdlog::warn(
+                    "--pdo-config: '{}' isn't a numeric PDO index and there's no ESI match to resolve it by "
+                    "name against; this selector will be dropped",
+                    selector);
             }
             out.push_back(std::move(pdo));
         }
@@ -140,8 +190,8 @@ void ResolvePdoOverrides(std::vector<ecmqtt::PdoOverride>& overrides, ecmqtt::Es
                 "assignment will still be attempted on the wire, but field names/types won't be resolved",
                 ov.vendorId, ov.productCode, ov.revisionNo);
 
-        resolveDirection(dev, ov.rxPdoIndices, ecmqtt::DataDirection::Output, ov.rxPdos);
-        resolveDirection(dev, ov.txPdoIndices, ecmqtt::DataDirection::Input, ov.txPdos);
+        resolveDirection(dev, ov.rxPdoSelectors, ecmqtt::DataDirection::Output, ov.rxPdos);
+        resolveDirection(dev, ov.txPdoSelectors, ecmqtt::DataDirection::Input, ov.txPdos);
     }
 }
 
@@ -319,7 +369,16 @@ int main(int argc, char** argv) {
                 }
             }
 
-            result.emplace_back(ds, std::move(name), std::move(description));
+            std::vector<ecmqtt::AvailablePdo> availableRxPdos, availableTxPdos;
+            if (esiDevice) {
+                for (auto& p : esiDevice->pdos) {
+                    auto& target = p.direction == ecmqtt::DataDirection::Output ? availableRxPdos : availableTxPdos;
+                    target.push_back({p.index, p.name});
+                }
+            }
+
+            result.emplace_back(ds, std::move(name), std::move(description), std::move(availableRxPdos),
+                                 std::move(availableTxPdos));
         }
         return result;
     };
@@ -437,6 +496,9 @@ int main(int argc, char** argv) {
                 {"name", meta["name"]},
                 {"description", meta["description"]},
                 {"state", meta["state"]},
+                {"error", meta["error"]},
+                {"alarmCode", meta["alarmCode"]},
+                {"alarm", meta["alarm"]},
                 {"reportedCsa", meta["reportedCsa"]},
                 {"ringCsa", meta["ringCsa"]},
             };
@@ -545,6 +607,18 @@ int main(int argc, char** argv) {
 
     int exitCode = 0;
     uint64_t overruns = 0;
+    uint64_t cycleCount = 0;
+    // What was last published, so the check below can tell whether
+    // anything actually needs republishing -- both backends now keep
+    // alState/alStatusCode fresh every single updateIO() call for free (see
+    // IghBackend::RefreshSlaveStatesRt()/SoemBackend::RefreshSlaveStates()),
+    // so this deliberately does NOT call anything new here: just compares
+    // already-current in-memory fields against this cache. Unlike an
+    // earlier version of this check (reverted -- see git history), nothing
+    // here calls ecrt_master_get_slave() or any other backend query, so it
+    // doesn't reproduce that regression.
+    std::vector<std::pair<ecmqtt::SlaveAlState, uint16_t>> lastPublishedStates;
+    constexpr uint64_t kStatePublishCheckCycles = 100;
     auto lastHotplugCheck = std::chrono::steady_clock::now();
     // First tick fires immediately (not after a full period) so the first
     // updateIO() call lands as soon as possible after activate().
@@ -614,6 +688,27 @@ int main(int argc, char** argv) {
                          std::chrono::duration<double, std::milli>(period).count(), overruns);
         }
 
+        if (++cycleCount % kStatePublishCheckCycles == 0) {
+            bool changed;
+            {
+                std::lock_guard<std::mutex> lock(ecMutex);
+                auto& liveSlaves = backend->slaves();
+                changed = lastPublishedStates.size() != liveSlaves.size();
+                if (!changed)
+                    for (size_t i = 0; i < liveSlaves.size(); ++i)
+                        if (lastPublishedStates[i].first != liveSlaves[i].alState ||
+                            lastPublishedStates[i].second != liveSlaves[i].alStatusCode) {
+                            changed = true;
+                            break;
+                        }
+                if (changed) {
+                    lastPublishedStates.clear();
+                    for (auto& s : liveSlaves) lastPublishedStates.emplace_back(s.alState, s.alStatusCode);
+                }
+            }
+            if (changed) publishMetadataAndSubscribe();
+        }
+
         if (cfg.hotplug && backend->supportsHotplug()) {
             auto hpNow = std::chrono::steady_clock::now();
             if (hpNow - lastHotplugCheck >= std::chrono::seconds(2)) {
@@ -623,11 +718,29 @@ int main(int argc, char** argv) {
                         "EtherCAT topology change detected; reconfiguring (all slaves briefly pause)...");
                     publishMetadataAndSubscribe("rescanning");
 
+                    // A hotplug reconfigure deactivates and reactivates the
+                    // whole master -- IGH gets a brand-new domain, so every
+                    // output byte comes back zeroed/default instead of
+                    // whatever was last written. Snapshot the current value
+                    // of every output variable now, while `devices` (and
+                    // the backend storage it points into) is still the
+                    // live pre-reconfigure state, and re-queue them as
+                    // ordinary writes below once the new topology is up --
+                    // same path an MQTT-triggered write already takes, so
+                    // whatever's physically being controlled doesn't
+                    // silently reset just because some other slave on the
+                    // bus was added/removed.
                     std::vector<uint16_t> oldCsas;
+                    std::deque<WriteRequest> savedOutputs;
                     {
                         std::lock_guard<std::mutex> lock(ecMutex);
                         oldCsas.reserve(devices.size());
-                        for (auto& d : devices) oldCsas.push_back(d.GetCsa(cfg.useReportedCsa));
+                        for (auto& d : devices) {
+                            uint16_t csa = d.GetCsa(cfg.useReportedCsa);
+                            oldCsas.push_back(csa);
+                            for (auto* v : d.GetOutputVariables())
+                                savedOutputs.push_back({csa, v->index, v->subIndex, d.ReadVariableAsJson(*v)});
+                        }
                     }
 
                     try {
@@ -677,6 +790,13 @@ int main(int argc, char** argv) {
                     }
 
                     spdlog::info("Reconfigured: {} slave(s) now known", devices.size());
+
+                    if (!savedOutputs.empty()) {
+                        spdlog::info("Re-applying {} output value(s) saved before the reconfigure",
+                                     savedOutputs.size());
+                        std::lock_guard<std::mutex> lock(writeMutex);
+                        for (auto& req : savedOutputs) pendingWrites.push_back(std::move(req));
+                    }
 
                     if (cfg.hotplugCleanup) {
                         for (uint16_t csa : oldCsas) {

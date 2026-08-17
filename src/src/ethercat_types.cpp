@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 
 namespace ecmqtt {
 
@@ -129,6 +130,76 @@ const char* ToString(SlaveAlState state) {
         case SlaveAlState::Op: return "OP";
         default: return "UNKNOWN";
     }
+}
+
+namespace {
+struct AlStatusEntry {
+    uint16_t code;
+    const char* message;
+};
+
+// ETG.1000.6 standard AL Status Codes, copied verbatim from IGH's own table
+// (master/fsm_change.c al_status_messages[]) so the text matches dmesg
+// exactly for the same code.
+constexpr AlStatusEntry kAlStatusMessages[] = {
+    {0x0000, "No error"},
+    {0x0001, "Unspecified error"},
+    {0x0002, "No Memory"},
+    {0x0011, "Invalid requested state change"},
+    {0x0012, "Unknown requested state"},
+    {0x0013, "Bootstrap not supported"},
+    {0x0014, "No valid firmware"},
+    {0x0015, "Invalid mailbox configuration"},
+    {0x0016, "Invalid mailbox configuration"},
+    {0x0017, "Invalid sync manager configuration"},
+    {0x0018, "No valid inputs available"},
+    {0x0019, "No valid outputs"},
+    {0x001A, "Synchronization error"},
+    {0x001B, "Sync manager watchdog"},
+    {0x001C, "Invalid sync manager types"},
+    {0x001D, "Invalid output configuration"},
+    {0x001E, "Invalid input configuration"},
+    {0x001F, "Invalid watchdog configuration"},
+    {0x0020, "Slave needs cold start"},
+    {0x0021, "Slave needs INIT"},
+    {0x0022, "Slave needs PREOP"},
+    {0x0023, "Slave needs SAFEOP"},
+    {0x0024, "Invalid Input Mapping"},
+    {0x0025, "Invalid Output Mapping"},
+    {0x0026, "Inconsistent Settings"},
+    {0x0027, "Freerun not supported"},
+    {0x0028, "Synchronization not supported"},
+    {0x0029, "Freerun needs 3 Buffer Mode"},
+    {0x002A, "Background Watchdog"},
+    {0x002B, "No Valid Inputs and Outputs"},
+    {0x002C, "Fatal Sync Error"},
+    {0x002D, "No Sync Error"},
+    {0x0030, "Invalid DC SYNCH configuration"},
+    {0x0031, "Invalid DC latch configuration"},
+    {0x0032, "PLL error"},
+    {0x0033, "DC Sync IO Error"},
+    {0x0034, "DC Sync Timeout Error"},
+    {0x0035, "DC Invalid Sync Cycle Time"},
+    {0x0036, "DC Sync0 Cycle Time"},
+    {0x0037, "DC Sync1 Cycle Time"},
+    {0x0041, "MBX_AOE"},
+    {0x0042, "MBX_EOE"},
+    {0x0043, "MBX_COE"},
+    {0x0044, "MBX_FOE"},
+    {0x0045, "MBX_SOE"},
+    {0x004F, "MBX_VOE"},
+    {0x0050, "EEPROM No Access"},
+    {0x0051, "EEPROM Error"},
+    {0x0060, "Slave Restarted Locally"},
+};
+} // namespace
+
+std::string AlStatusMessage(uint16_t code) {
+    for (auto& entry : kAlStatusMessages)
+        if (entry.code == code) return entry.message;
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "Unknown status code 0x%04X", code);
+    return buf;
 }
 
 } // namespace ecmqtt

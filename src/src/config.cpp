@@ -43,32 +43,21 @@ std::optional<Config> ParseArgs(int argc, char** argv) {
         ("debug", "Debug logging.", cxxopts::value<bool>()->default_value("false"))
         ("client-id", "MQTT client ID.", cxxopts::value<std::string>()->default_value("EtherCATMaster"))
         ("use-reported-csa", "Use reported CSA instead of ring CSA for MQTT topics.", cxxopts::value<bool>()->default_value("false"))
-        ("realtime", "Request SCHED_FIFO + mlockall for the cycle thread. Validate on your target first: "
-                     "on some systems this can starve the kernel's own EtherCAT master thread instead of helping.",
+        ("realtime", "Request SCHED_FIFO + mlockall for the cycle thread (validate on your target first).",
          cxxopts::value<bool>()->default_value("false"))
-        ("op-timeout", "Milliseconds to wait for all slaves to reach OPERATIONAL after activation before "
-                       "giving up. SOEM fails startup on timeout; IGH warns and continues (also applies "
-                       "after every --hotplug reconfigure on IGH).",
+        ("op-timeout", "Milliseconds to wait for slaves to reach OPERATIONAL after activation.",
          cxxopts::value<uint32_t>()->default_value("2000"))
-        ("pdo-config", "Path to a JSON file selecting a non-default PDO assignment for specific slaves "
-                       "(matched by vendor/product/revision), picking an alternate RxPdo/TxPdo declared in "
-                       "their ESI file instead of whatever's currently active.", cxxopts::value<std::string>())
+        ("pdo-config", "Path to a JSON file selecting non-default PDO assignments for specific slaves. See README.",
+         cxxopts::value<std::string>())
 #if defined(EC_BACKEND_SOEM)
-        ("write-alias", "Write a persistent SII station alias to one or more slaves addressed by their "
-                        "current ring position, then exit. Format: "
-                        "<ringPos>=<alias>[,<ringPos>=<alias>...]. Requires power-cycling the slave(s) for "
-                        "the new alias to take effect.",
+        ("write-alias", "Write a persistent SII alias to slave(s) by ring position, then exit. "
+                        "Format: <ringPos>=<alias>[,<ringPos>=<alias>...].",
          cxxopts::value<std::string>())
 #endif
 #if defined(EC_BACKEND_IGH)
-        ("hotplug", "Periodically check for hot-plugged/removed slaves and reconfigure to pick them up. "
-                    "Briefly pauses cyclic servicing for every slave (not just the one that changed) each "
-                    "time it reconfigures.",
-         cxxopts::value<bool>()->default_value("false"))
-        ("hotplug-cleanup", "With --hotplug, also clear a removed slave's retained MQTT metadata and "
-                            "process-data topics and unsubscribe from its outputs, instead of leaving them "
-                            "retained under a CSA nothing will publish to again.",
-         cxxopts::value<bool>()->default_value("false"))
+        ("hotplug", "Watch for hot-plugged/removed slaves and reconfigure to pick them up. "
+                    "Optional mode: cleanup (also clear a removed slave's retained MQTT state). See README.",
+         cxxopts::value<std::string>()->implicit_value("on"))
 #endif
         ("h,help", "Print usage.");
     // clang-format on
@@ -108,8 +97,13 @@ std::optional<Config> ParseArgs(int argc, char** argv) {
     if (result.count("write-alias")) cfg.writeAlias = result["write-alias"].as<std::string>();
 #endif
 #if defined(EC_BACKEND_IGH)
-    cfg.hotplug = result["hotplug"].as<bool>();
-    cfg.hotplugCleanup = result["hotplug-cleanup"].as<bool>();
+    if (result.count("hotplug")) {
+        std::string mode = result["hotplug"].as<std::string>();
+        if (mode != "on" && mode != "cleanup")
+            throw std::invalid_argument("--hotplug: expected no value or 'cleanup', got '" + mode + "'");
+        cfg.hotplug = true;
+        cfg.hotplugCleanup = (mode == "cleanup");
+    }
 #endif
 
     if (cfg.port <= 0 || cfg.port > 65535)

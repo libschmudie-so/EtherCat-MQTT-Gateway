@@ -234,6 +234,8 @@ public:
             // now means a metadata publish that lands before activate()
             // still shows something real instead of always Unknown.
             ds.alState = SlaveAlStateFromRaw(static_cast<uint8_t>(ec_slave[i].state));
+            ds.alStatusCode = ec_slave[i].ALstatuscode;
+            ds.alError = ec_slave[i].ALstatuscode != 0;
 
             // A direction's assign object (0x1C12/0x1C13) reading fine is not
             // enough: some slaves report a valid assign list but their
@@ -286,11 +288,8 @@ public:
             throw std::runtime_error("Not all EtherCAT slaves reached OPERATIONAL state");
         }
 
-        // ec_statecheck() above only tracks the aggregate state at index 0;
-        // refresh every individual slave's ec_slave[i].state (for metadata,
-        // see DiscoveredSlave::alState) with a dedicated read.
-        ec_readstate();
-        for (int i = 1; i <= ec_slavecount; ++i) slaves_[i - 1].alState = SlaveAlStateFromRaw(ec_slave[i].state);
+        // ec_statecheck() above only tracks the aggregate state at index 0.
+        RefreshSlaveStates();
 
         spdlog::info("SOEM: {} slave(s) at OPERATIONAL", ec_slavecount);
     }
@@ -304,6 +303,14 @@ public:
         applyWrites();
         ec_send_processdata();
         ec_receive_processdata(EC_TIMEOUTRET);
+
+        // ec_readstate() is a single broadcast read covering every slave in
+        // one datagram (not a per-slave call), so unlike the one IGH-side
+        // function that turned out to be unsafe to call this often (see
+        // igh_backend.cpp's RefreshSlaveStatesRt() doc comment), this is
+        // the standard, lightweight way SOEM applications keep per-slave
+        // state current every cycle.
+        RefreshSlaveStates();
     }
 
     void shutdown() override {
@@ -377,6 +384,20 @@ public:
     }
 
 private:
+    // Refreshes alState/alStatusCode/alError for every slave from a single
+    // broadcast read (see updateIO()'s doc comment on why this is safe to
+    // call every cycle, unlike the analogous IGH mechanism's original,
+    // unsafe attempt).
+    void RefreshSlaveStates() {
+        ec_readstate();
+        for (int i = 1; i <= ec_slavecount; ++i) {
+            auto& ds = slaves_[i - 1];
+            ds.alState = SlaveAlStateFromRaw(ec_slave[i].state);
+            ds.alStatusCode = ec_slave[i].ALstatuscode;
+            ds.alError = ec_slave[i].ALstatuscode != 0;
+        }
+    }
+
     std::array<char, kIoMapSize> ioMap_{};
     uint32_t opWaitTimeoutMs_ = 2000;
     std::vector<DiscoveredSlave> slaves_;

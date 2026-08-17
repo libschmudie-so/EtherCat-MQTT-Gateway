@@ -15,6 +15,13 @@ uint32_t NumFromJson(const nlohmann::json& j) {
     return j.get<uint32_t>();
 }
 
+// A selector is either a PDO index (string or JSON integer) or a PDO name
+// (string only) -- kept as a raw string here, resolved against ESI later.
+std::string SelectorFromJson(const nlohmann::json& j) {
+    if (j.is_string()) return j.get<std::string>();
+    return std::to_string(j.get<uint64_t>());
+}
+
 } // namespace
 
 std::vector<PdoOverride> LoadPdoOverrideConfig(const std::string& path) {
@@ -31,9 +38,9 @@ std::vector<PdoOverride> LoadPdoOverrideConfig(const std::string& path) {
         ov.productCode = NumFromJson(oj.at("productCode"));
         ov.revisionNo = NumFromJson(oj.at("revisionNo"));
         for (const auto& e : oj.value("rxPdo", nlohmann::json::array()))
-            ov.rxPdoIndices.push_back(static_cast<uint16_t>(NumFromJson(e)));
+            ov.rxPdoSelectors.push_back(SelectorFromJson(e));
         for (const auto& e : oj.value("txPdo", nlohmann::json::array()))
-            ov.txPdoIndices.push_back(static_cast<uint16_t>(NumFromJson(e)));
+            ov.txPdoSelectors.push_back(SelectorFromJson(e));
         result.push_back(std::move(ov));
     }
     return result;

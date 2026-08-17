@@ -41,6 +41,14 @@ SlaveAlState SlaveAlStateFromRaw(uint8_t raw);
 
 const char* ToString(SlaveAlState state);
 
+// Human-readable text for a slave's AL Status Code (ESC register 0x0134,
+// ETG.1000.6 Annex) -- e.g. 0x001E -> "Invalid input configuration". 0
+// ("No error") is a valid, normal code, not a placeholder for "unknown".
+// Table mirrors IGH's own (master/fsm_change.c al_status_messages[]) so the
+// text matches what shows up in `dmesg` for the same code; falls back to a
+// generic "Unknown status code" for anything not in the standard table.
+std::string AlStatusMessage(uint16_t code);
+
 // Best-effort mapping from an ESI <DataType> string (e.g. "BOOL", "UINT16",
 // "REAL32") to our enum. Falls back to Unknown for anything unrecognized.
 EthercatDataType EsiDataTypeFromString(const std::string& esiType);

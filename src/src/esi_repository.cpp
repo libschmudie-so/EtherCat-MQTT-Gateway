@@ -51,6 +51,9 @@ void ParsePdoBlock(tinyxml2::XMLElement* deviceEl, const char* tag, DataDirectio
         if (auto* idxEl = pdoEl->FirstChildElement("Index"))
             if (const char* txt = idxEl->GetText())
                 pdo.index = static_cast<uint16_t>(ParseEsiNumber(txt));
+        if (auto* nameEl = pdoEl->FirstChildElement("Name"))
+            if (const char* txt = nameEl->GetText())
+                pdo.name = txt;
 
         for (auto* entryEl = pdoEl->FirstChildElement("Entry"); entryEl;
              entryEl = entryEl->NextSiblingElement("Entry")) {
@@ -154,15 +157,33 @@ bool EsiRepository::ParseDeviceFromFile(const std::string& path, const Key& targ
         out.vendorId = vendorId;
         out.productCode = productCode;
         out.revisionNo = revisionNo;
+        // name is the short <Type> text (e.g. "EL1008") -- the identifier
+        // printed on the terminal itself. <Name> is typically that same
+        // text followed by a longer description (e.g. "EL1008 8Ch. Dig.
+        // Input 24V, 3ms"); keep the two separate rather than letting the
+        // longer one clobber the short one, matching how the original
+        // (pre-port) tool treated them.
         if (const char* typeText = typeEl->GetText()) out.name = typeText;
 
+        std::string longName;
         if (auto* nameEl = deviceEl->FirstChildElement("Name"))
             if (const char* txt = nameEl->GetText())
-                out.name = txt;
+                longName = txt;
 
         if (auto* commentEl = deviceEl->FirstChildElement("Comment"))
             if (const char* txt = commentEl->GetText())
                 out.description = txt;
+        if (out.description.empty()) {
+            // <Name> commonly repeats <Type> verbatim as its own prefix --
+            // strip that duplicate so the description adds information
+            // instead of just restating the name.
+            out.description = longName;
+            if (!out.name.empty() && out.description.rfind(out.name, 0) == 0) {
+                out.description = out.description.substr(out.name.size());
+                size_t start = out.description.find_first_not_of(" \t");
+                out.description = start == std::string::npos ? "" : out.description.substr(start);
+            }
+        }
         if (out.description.empty())
             out.description = out.name;
 

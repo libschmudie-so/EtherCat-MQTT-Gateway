@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -102,7 +103,6 @@ public:
         // updateIO() is the only other caller, and it only ever runs once
         // there's at least one slave. Untested territory otherwise.
         if (!slaves_.empty()) {
-            constexpr uint8_t kAlStateOp = 0x08;
             const int maxChecks = std::max<int>(1, static_cast<int>(opWaitTimeoutMs_ / 50));
             bool allOp = false;
             for (int check = 0; check < maxChecks && !allOp; ++check) {
@@ -113,11 +113,18 @@ public:
                 }
                 ecrt_master_send(master_);
 
+                // RT-safe (ecrt_slave_config_state()), not
+                // ecrt_master_get_slave() -- see RefreshSlaveStatesRt()'s
+                // doc comment for why that distinction matters. Also
+                // updates alStatusCode/alError as a side effect, and
+                // doubles as the "final pass" the metadata needs: by the
+                // time this loop exits, slaves_[].alState already reflects
+                // its last iteration, so no separate pass is needed after.
+                RefreshSlaveStatesRt();
+
                 allOp = true;
-                for (unsigned int pos = 0; pos < slaves_.size(); ++pos) {
-                    ec_slave_info_t si{};
-                    if (ecrt_master_get_slave(master_, static_cast<uint16_t>(pos), &si) != 0 ||
-                        si.al_state != kAlStateOp) {
+                for (auto& ds : slaves_) {
+                    if (ds.alState != SlaveAlState::Op) {
                         allOp = false;
                         break;
                     }
@@ -126,17 +133,6 @@ public:
             }
             if (!allOp)
                 spdlog::warn("IGH: not all slaves reached OPERATIONAL within the timeout after activation");
-
-            // Record each slave's actually-reached AL state for metadata
-            // (DiscoveredSlave::alState) -- a dedicated final pass rather
-            // than reusing whatever the loop above last saw, since it
-            // breaks out of its per-slave scan on the first non-OP slave
-            // and so doesn't necessarily have a fresh read for every one.
-            for (unsigned int pos = 0; pos < slaves_.size(); ++pos) {
-                ec_slave_info_t si{};
-                if (ecrt_master_get_slave(master_, static_cast<uint16_t>(pos), &si) == 0)
-                    slaves_[pos].alState = SlaveAlStateFromRaw(si.al_state);
-            }
         }
 
         spdlog::info("IGH: master activated");
@@ -157,6 +153,8 @@ public:
         applyWrites();
         ecrt_domain_queue(domain_);
         ecrt_master_send(master_);
+
+        RefreshSlaveStatesRt();
     }
 
     void shutdown() override {
@@ -201,6 +199,8 @@ public:
 
         slaves_.clear();
         pending_.clear();
+        slaveConfigs_.clear();
+        alStatusRequests_.clear();
 
         // No domain-free call exists in IGH's public API -- the old domain_
         // is leaked (owned/released by the master itself, eventually, on
@@ -212,6 +212,53 @@ public:
     }
 
 private:
+    // Refreshes alState/alStatusCode/alError for every slave from a live
+    // read, called every updateIO() cycle. Both underlying calls are
+    // documented rt_safe (apiusage{master_op,rt_safe} in ecrt.h) -- unlike
+    // ecrt_master_get_slave(), which carries no such tag and, called
+    // repeatedly this way instead, caused a real production incident (see
+    // git history: it started failing outright under sustained polling and
+    // cascaded into a reconfigure loop that kept dropping slaves). This is
+    // a deliberately different, purpose-built mechanism, not a retry of
+    // the same idea:
+    //  - alState: ecrt_slave_config_state() against the ec_slave_config_t
+    //    saved in slaveConfigs_ at rescan() time.
+    //  - alStatusCode: a register request (alStatusRequests_, also created
+    //    at rescan() time) reading ESC register 0x0134 (AL Status Code,
+    //    ETG.1000.6). This is an async state machine per IGH's own design
+    //    -- schedule a read, poll for completion, re-arm -- driven one step
+    //    per call here rather than blocking for it.
+    void RefreshSlaveStatesRt() {
+        for (size_t i = 0; i < slaves_.size(); ++i) {
+            if (i < slaveConfigs_.size() && slaveConfigs_[i]) {
+                ec_slave_config_state_t state{};
+                if (ecrt_slave_config_state(slaveConfigs_[i], &state) == 0)
+                    slaves_[i].alState = SlaveAlStateFromRaw(static_cast<uint8_t>(state.al_state));
+            }
+
+            if (i >= alStatusRequests_.size() || !alStatusRequests_[i]) continue;
+            ec_reg_request_t* req = alStatusRequests_[i];
+            switch (ecrt_reg_request_state(req)) {
+                case EC_REQUEST_UNUSED:
+                    ecrt_reg_request_read(req, 0x0134, 2);
+                    break;
+                case EC_REQUEST_SUCCESS: {
+                    uint16_t code = EC_READ_U16(ecrt_reg_request_data(req));
+                    slaves_[i].alStatusCode = code;
+                    slaves_[i].alError = code != 0;
+                    ecrt_reg_request_read(req, 0x0134, 2); // re-arm for the next refresh
+                    break;
+                }
+                case EC_REQUEST_ERROR:
+                    ecrt_reg_request_read(req, 0x0134, 2); // re-arm and try again next cycle
+                    break;
+                case EC_REQUEST_BUSY:
+                default:
+                    break; // still in flight -- check again next cycle
+            }
+        }
+    }
+
     // Builds sync/pdo/entry arrays from pdoList and hands them straight to
     // ecrt_slave_config_pdos(), which both configures the SM's CoE
     // assignment for us and makes exactly these entries available for
@@ -225,6 +272,17 @@ private:
     void applyPdoList(ec_slave_config_t* sc, uint8_t syncIdx, ec_direction_t syncDir, DataDirection dir,
                        unsigned int pos, const std::vector<PdoOverridePdo>& pdoList, DiscoveredSlave& ds,
                        const char* label) {
+        for (size_t i = 0; i < pdoList.size(); ++i) {
+            std::string entriesStr;
+            for (auto& e : pdoList[i].entries)
+                entriesStr += fmt::format("{}{:#06x}:{:#04x}/{}", entriesStr.empty() ? "" : ", ", e.index,
+                                           e.subIndex, e.bitLen);
+            spdlog::debug("IGH: slave {} sync {}: {} PDO[{}] = {:#06x} ({} entr{}: {})", pos, syncIdx, label, i,
+                          pdoList[i].pdoIndex, pdoList[i].entries.size(),
+                          pdoList[i].entries.size() == 1 ? "y" : "ies",
+                          entriesStr.empty() ? "none" : entriesStr);
+        }
+
         std::vector<std::vector<ec_pdo_entry_info_t>> entryStorage(pdoList.size());
         std::vector<ec_pdo_info_t> pdoInfos(pdoList.size());
         for (size_t i = 0; i < pdoList.size(); ++i) {
@@ -272,7 +330,7 @@ private:
     // while the master is in idle phase (before the first activate(), or
     // just after a deactivate()) -- IGH's own docs: slave configuration
     // can't be altered once ecrt_master_activate() has run.
-    void rescan(const Config& cfg, EsiRepository& esiRepo) {
+    void rescan(const Config& cfg, EsiRepository& esiRepo, int attempt = 0) {
         ec_master_info_t info{};
         if (ecrt_master(master_, &info) != 0) throw std::runtime_error("ecrt_master() failed to obtain master info");
 
@@ -298,12 +356,32 @@ private:
         }
 
         slaves_.reserve(info.slave_count);
+        bool anyZeroIdentity = false;
 
         for (unsigned int pos = 0; pos < info.slave_count; ++pos) {
+            // Belt-and-braces on top of the scan_busy wait above: even with
+            // that, a slave (typically one the topology change didn't even
+            // touch) can occasionally still hand back a freshly-zeroed
+            // ec_slave_info_t on the first ask -- vendor_id 0 is never a
+            // real slave's identity, so retry a few times before accepting
+            // it rather than latching an obviously-bogus reading.
             ec_slave_info_t slaveInfo{};
-            if (ecrt_master_get_slave(master_, static_cast<uint16_t>(pos), &slaveInfo) != 0) {
+            bool gotSlaveInfo = false;
+            for (int attempt = 0; attempt < 10; ++attempt) {
+                gotSlaveInfo = ecrt_master_get_slave(master_, static_cast<uint16_t>(pos), &slaveInfo) == 0;
+                if (gotSlaveInfo && slaveInfo.vendor_id != 0) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            if (!gotSlaveInfo) {
                 spdlog::warn("IGH: failed to get slave info at position {}", pos);
                 continue;
+            }
+            if (slaveInfo.vendor_id == 0) {
+                anyZeroIdentity = true;
+                spdlog::warn(
+                    "IGH: slave {} still reports vendor 0 after retrying for {}ms; using it anyway. Its name/ESI "
+                    "match will likely be wrong until the next rescan.",
+                    pos, 10 * 20);
             }
 
             DiscoveredSlave ds;
@@ -323,6 +401,7 @@ private:
             // main.cpp's "rescanning"/"waiting" hotplug states -- still
             // shows something real instead of always Unknown.
             ds.alState = SlaveAlStateFromRaw(slaveInfo.al_state);
+            ds.alError = slaveInfo.error_flag != 0;
 
             ec_slave_config_t* sc = ecrt_master_slave_config(master_, /*alias=*/0, static_cast<uint16_t>(pos),
                                                               slaveInfo.vendor_id, slaveInfo.product_code);
@@ -330,9 +409,21 @@ private:
                 spdlog::warn("IGH: ecrt_master_slave_config failed for slave {} ('{}', vendor {:#x} product {:#x} "
                              "rev {:#x})",
                              pos, ds.liveName, ds.vendorId, ds.productCode, ds.revisionNo);
+                slaveConfigs_.push_back(nullptr); // keeps index alignment with slaves_ for updateIO()
+                alStatusRequests_.push_back(nullptr);
                 slaves_.push_back(std::move(ds));
                 continue;
             }
+
+            slaveConfigs_.push_back(sc);
+            // Reserved for the AL Status Code register (0x0134, 2 bytes) --
+            // created here (non-realtime, before activate(), as
+            // ecrt_slave_config_create_reg_request() requires) so updateIO()
+            // can drive the actual read every cycle afterward via the
+            // RT-safe ecrt_reg_request_read()/_state()/_data() calls. Null
+            // if creation failed; updateIO() just skips a null entry and
+            // alStatusCode stays at its default (0, "No error").
+            alStatusRequests_.push_back(ecrt_slave_config_create_reg_request(sc, 2));
 
             const PdoOverride* ov =
                 cfg.pdoOverrides.empty() ? nullptr
@@ -342,23 +433,73 @@ private:
             for (uint8_t syncIdx = 0; syncIdx < slaveInfo.sync_count; ++syncIdx) {
                 ec_sync_info_t sync{};
                 if (ecrt_master_get_sync_manager(master_, static_cast<uint16_t>(pos), syncIdx, &sync) != 0) continue;
-                if (sync.dir != EC_DIR_OUTPUT && sync.dir != EC_DIR_INPUT) continue; // mailbox SMs etc.
+                // This does NOT actually exclude mailbox sync managers, despite
+                // appearances: SM0/SM1 (conventionally Mailbox-Out/Mailbox-In
+                // per ETG.1000.4, for any slave that has CoE at all) report the
+                // exact same EC_DIR_OUTPUT/EC_DIR_INPUT values as real
+                // process-data SMs -- IGH's public API has no distinct
+                // "mailbox" direction. Kept only to drop whatever reports
+                // neither (rare/invalid).
+                if (sync.dir != EC_DIR_OUTPUT && sync.dir != EC_DIR_INPUT) continue;
+                // The actual mailbox exclusion: skip SM0/SM1 for any slave
+                // that has CoE (sdo_count > 0 is a reliable proxy -- a
+                // mailbox-less slave's real process data can legitimately
+                // start at SM0/1, so this must stay conditional). Confirmed
+                // on real hardware (a Beckhoff EL3002): without this, a
+                // --pdo-config override or the ESI-default fallback below
+                // would get applied to SM1 (mailbox-in) right alongside the
+                // real process-data SM, corrupting CoE mailbox communication
+                // and leaving the slave stuck at PREOP+ERROR ("Invalid input
+                // configuration").
+                if (syncIdx < 2 && slaveInfo.sdo_count > 0) continue;
 
                 DataDirection dir = (sync.dir == EC_DIR_OUTPUT) ? DataDirection::Output : DataDirection::Input;
 
                 const std::vector<PdoOverridePdo>* overridePdos =
                     ov ? (dir == DataDirection::Output ? &ov->rxPdos : &ov->txPdos) : nullptr;
                 if (overridePdos && !overridePdos->empty()) {
-                    // A custom assignment was requested for this direction.
-                    // ecrt_master_get_pdo/_pdo_entry below reflect what's
-                    // live *right now*, not our override (that only lands on
-                    // the wire later, during the master's own state-
-                    // transition sequence around activation) -- so build our
-                    // own PDO/entry arrays from the override (already
-                    // resolved against ESI by main.cpp) instead of trusting
-                    // live introspection for this sync manager.
-                    applyPdoList(sc, syncIdx, sync.dir, dir, pos, *overridePdos, ds, "overridden");
-                    continue; // this sync manager is fully handled by the override
+                    // main.cpp still records a selector that didn't resolve
+                    // against ESI (unknown name, or a numeric index with no
+                    // ESI match at all) as a PdoOverridePdo with empty
+                    // entries -- fine for SOEM, which only ever writes the
+                    // raw index to 0x1C12/0x1C13 and lets the slave supply
+                    // its own entries. IGH has no such thing: passing
+                    // n_entries=0 to ecrt_slave_config_pdos() means "use
+                    // the slave's default mapping" per its own docs, which
+                    // is NOT a no-op for a Fixed-PDO slave (e.g. an EL3012)
+                    // -- observed on real hardware: the slave refuses the
+                    // resulting remap ("does not support changing the PDO
+                    // mapping", "Entries to map: (none)") and gets stuck in
+                    // PREOP+ERROR ("Invalid input configuration") instead
+                    // of keeping its already-working mapping. Drop any
+                    // unresolved selector before it ever reaches the wire.
+                    std::vector<PdoOverridePdo> resolved;
+                    for (auto& p : *overridePdos)
+                        if (!p.entries.empty()) resolved.push_back(p);
+                    if (resolved.size() != overridePdos->size())
+                        spdlog::warn(
+                            "IGH: slave {} sync {}: {} of {} requested PDO override selector(s) didn't resolve "
+                            "against ESI and will be skipped (IGH needs full entry content up front, unlike "
+                            "SOEM). See the earlier '--pdo-config: ... not found' warning(s) for which.",
+                            pos, syncIdx, overridePdos->size() - resolved.size(), overridePdos->size());
+
+                    if (!resolved.empty()) {
+                        // A custom assignment was requested for this
+                        // direction. ecrt_master_get_pdo/_pdo_entry below
+                        // reflect what's live *right now*, not our override
+                        // (that only lands on the wire later, during the
+                        // master's own state-transition sequence around
+                        // activation) -- so build our own PDO/entry arrays
+                        // from the override (already resolved against ESI
+                        // by main.cpp) instead of trusting live
+                        // introspection for this sync manager.
+                        applyPdoList(sc, syncIdx, sync.dir, dir, pos, resolved, ds, "overridden");
+                        continue; // this sync manager is fully handled by the override
+                    }
+                    // Nothing usable survived filtering -- fall through to
+                    // the normal live-introspection path below, same as if
+                    // no override had been requested for this direction at
+                    // all, rather than leaving the sync manager unconfigured.
                 }
 
                 if (sync.n_pdos == 0) {
@@ -382,7 +523,7 @@ private:
                     if (esiDevice) {
                         std::vector<PdoOverridePdo> esiDefault;
                         for (auto& p : esiDevice->pdos) {
-                            if (p.direction != dir) continue;
+                            if (p.direction != dir || p.entries.empty()) continue;
                             PdoOverridePdo pdo;
                             pdo.pdoIndex = p.index;
                             for (auto& e : p.entries) pdo.entries.push_back({e.index, e.subIndex, e.bitLen});
@@ -435,6 +576,98 @@ private:
         }
 
         spdlog::info("IGH: {} slave(s) discovered and registered", slaves_.size());
+
+        // A slave's identity (vendor/product/revision, read once from SII
+        // during the bus scan) can get stuck all-zero independently of its
+        // AL state (tracked live every cycle via a completely separate
+        // path) -- observed on real hardware staying at OP the whole time
+        // this happens. Retrying our own read harder (above) doesn't help
+        // when it's the master's own cached record that's wrong, not our
+        // read of it.
+        //
+        // Bounded to 4 attempts total, escalating each time -- an unbounded
+        // retry would keep perturbing the bus for a slave with a genuine
+        // fault that nothing here will fix:
+        //  1, 2: `ethercat rescan` (the same real rescan the command-line
+        //     tool commands -- shelling out to that actual tool rather than
+        //     reimplementing its ioctl ourselves: that ioctl is defined in
+        //     master/ioctl.h, which isn't part of the installed public API,
+        //     only ecrt.h/ectty.h are, so unlike ecrt.h it carries no
+        //     stability guarantee across IGH versions), then a settle delay
+        //     before looking again -- rescan just commands the kernel to
+        //     *start* a fresh scan asynchronously, so recursing immediately
+        //     risks re-checking scan_busy before the kernel has even set
+        //     it, seeing a stale "not busy" and reading the still-broken
+        //     data right back. Empirically this alone can take more than
+        //     one try.
+        //  3: a harder reset than a topology rescan alone -- deactivate and
+        //     recreate the domain here (the same "bus reinit" reconfigure()
+        //     does for a hotplug event), then a longer settle delay.
+        //  4 (final): harder still -- release and re-request the master
+        //     entirely. Confirmed on real hardware that a slave surviving
+        //     every attempt above can still clear on a full process
+        //     restart (which does exactly this, via ~IghBackend() and a
+        //     fresh ecrt_request_master() call), so replicate that
+        //     in-process rather than requiring an actual restart. Every
+        //     existing ec_slave_config_t*/ec_reg_request_t* (slaveConfigs_/
+        //     alStatusRequests_) becomes invalid the instant master_ is
+        //     released; clearing slaves_/pending_ below already implies
+        //     starting the rest of this scan from scratch, so those two get
+        //     cleared right alongside them and rebuilt fresh in the loop
+        //     below regardless of which attempt tier actually ran.
+        if (anyZeroIdentity && attempt < 4) {
+            slaves_.clear();
+            pending_.clear();
+            slaveConfigs_.clear();
+            alStatusRequests_.clear();
+
+            if (attempt == 3) {
+                spdlog::warn(
+                    "IGH: still stuck after rescanning and a domain reinit; releasing and re-requesting "
+                    "the master, the same recovery a full process restart provides (attempt {}/4)",
+                    attempt + 1);
+                ecrt_release_master(master_);
+                master_ = ecrt_request_master(0);
+                if (!master_)
+                    throw std::runtime_error(
+                        "ecrt_request_master(0) failed while recovering from a stuck-identity slave");
+                domain_ = ecrt_master_create_domain(master_);
+                if (!domain_)
+                    throw std::runtime_error(
+                        "ecrt_master_create_domain failed while recovering from a stuck-identity slave");
+                std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+            } else {
+                spdlog::warn(
+                    "IGH: at least one slave has a stuck all-zero identity; commanding `ethercat rescan` "
+                    "and retrying the scan (attempt {}/4)",
+                    attempt + 1);
+                if (std::system("ethercat rescan --master 0") != 0)
+                    spdlog::warn("IGH: `ethercat rescan` failed or wasn't found -- is the IGH command-line "
+                                 "tool installed and on PATH?");
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+                if (attempt == 2) {
+                    spdlog::warn(
+                        "IGH: still stuck after two rescans; reinitializing the bus (deactivate + "
+                        "recreate domain) before continuing");
+                    // Harmless if the master was never activated yet (e.g.
+                    // this is the very first configure() of the process) --
+                    // same reasoning reconfigure() already relies on by
+                    // calling this unconditionally. No domain-free call
+                    // exists in IGH's public API -- the old domain_ is
+                    // leaked (owned/released by the master itself,
+                    // eventually, on ecrt_release_master()), same as every
+                    // other reinit here.
+                    ecrt_master_deactivate(master_);
+                    domain_ = ecrt_master_create_domain(master_);
+                    if (!domain_)
+                        throw std::runtime_error("ecrt_master_create_domain failed during stuck-identity recovery");
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                }
+            }
+
+            rescan(cfg, esiRepo, attempt + 1);
+        }
     }
 
     struct PendingOffset {
@@ -448,6 +681,18 @@ private:
     uint32_t opWaitTimeoutMs_ = 2000;
     std::vector<DiscoveredSlave> slaves_;
     std::vector<PendingOffset> pending_;
+    // Parallel to slaves_ (index-aligned, entries may be null if this
+    // slave's ecrt_master_slave_config() failed). Both created in rescan(),
+    // required to happen in the non-realtime idle phase before activate();
+    // driven every cycle afterward from updateIO() via the RT-safe
+    // ecrt_slave_config_state()/reg_request calls to keep alState/
+    // alStatusCode live rather than frozen at whatever they were at the
+    // last activate(). Neither is individually freed on a hotplug
+    // reconfigure -- IGH's public API has no call for that, same as
+    // domain_ above; both are owned/released by the master itself,
+    // eventually, on ecrt_release_master().
+    std::vector<ec_slave_config_t*> slaveConfigs_;
+    std::vector<ec_reg_request_t*> alStatusRequests_;
 };
 
 } // namespace

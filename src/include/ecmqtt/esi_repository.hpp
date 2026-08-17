@@ -25,6 +25,11 @@ struct EsiPdoEntry {
 struct EsiPdo {
     uint16_t index = 0;
     DataDirection direction = DataDirection::Input; // RxPdo -> Output, TxPdo -> Input
+    // The RxPdo/TxPdo element's own <Name>, if declared -- e.g. an EL3012
+    // TxPdo might be named "Standard" vs "Compact". Lets --pdo-config
+    // select a mapping by this name instead of having to already know its
+    // numeric PDO index. Empty if the ESI file doesn't declare one.
+    std::string name;
     std::vector<EsiPdoEntry> entries;
 };
 

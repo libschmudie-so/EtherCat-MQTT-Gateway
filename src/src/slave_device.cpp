@@ -92,8 +92,10 @@ std::vector<uint8_t> FromHexString(const std::string& s) {
 
 } // namespace
 
-SlaveDevice::SlaveDevice(DiscoveredSlave& slave, std::string name, std::string description)
-    : slave_(&slave), name_(std::move(name)), description_(std::move(description)) {}
+SlaveDevice::SlaveDevice(DiscoveredSlave& slave, std::string name, std::string description,
+                          std::vector<AvailablePdo> availableRxPdos, std::vector<AvailablePdo> availableTxPdos)
+    : slave_(&slave), name_(std::move(name)), description_(std::move(description)),
+      availableRxPdos_(std::move(availableRxPdos)), availableTxPdos_(std::move(availableTxPdos)) {}
 
 nlohmann::json SlaveDevice::GetMetadata() const {
     nlohmann::json pdos = nlohmann::json::array();
@@ -114,13 +116,49 @@ nlohmann::json SlaveDevice::GetMetadata() const {
         });
     }
 
+    // Hex, "0x..." form -- directly copy-pasteable into a --pdo-config
+    // file's vendorId/productCode/revisionNo fields (ParseEsiNumber()
+    // accepts that form), so a device's own metadata is enough to write an
+    // override for it without having to dig through ESI XML by hand.
+    char vendorHex[16], productHex[16], revisionHex[16];
+    std::snprintf(vendorHex, sizeof(vendorHex), "0x%X", slave_->vendorId);
+    std::snprintf(productHex, sizeof(productHex), "0x%X", slave_->productCode);
+    std::snprintf(revisionHex, sizeof(revisionHex), "0x%X", slave_->revisionNo);
+
+    // Every RxPdo/TxPdo ESI declares for this device, not just the one
+    // currently assigned -- lets a client offer a --pdo-config picker
+    // without needing its own copy of ESI. index is hex "0x..." form, same
+    // convention as vendorId/productCode/revisionNo above.
+    auto pdoOptionsJson = [](const std::vector<AvailablePdo>& options) {
+        nlohmann::json arr = nlohmann::json::array();
+        for (auto& p : options) {
+            char idxHex[8];
+            std::snprintf(idxHex, sizeof(idxHex), "0x%04X", p.index);
+            arr.push_back({{"index", idxHex}, {"name", p.name}});
+        }
+        return arr;
+    };
+
+    // "0x0000" ("No error") even when there's no fault -- 0 is itself a
+    // valid, meaningful code, not a placeholder for "unset".
+    char alarmCodeHex[8];
+    std::snprintf(alarmCodeHex, sizeof(alarmCodeHex), "0x%04X", slave_->alStatusCode);
+
     return {
         {"name", name_},
         {"description", description_},
         {"state", ToString(slave_->alState)},
+        {"error", slave_->alError},
+        {"alarmCode", alarmCodeHex},
+        {"alarm", AlStatusMessage(slave_->alStatusCode)},
+        {"vendorId", vendorHex},
+        {"productCode", productHex},
+        {"revisionNo", revisionHex},
         {"reportedCsa", slave_->reportedCsa},
         {"ringCsa", slave_->ringCsa},
         {"pdos", pdos},
+        {"availableRxPdos", pdoOptionsJson(availableRxPdos_)},
+        {"availableTxPdos", pdoOptionsJson(availableTxPdos_)},
     };
 }
 
